@@ -114,9 +114,14 @@ class threadinfo {
         return index_;
     }
     loginfo* logger() const {
+        return (loginfo*)logger_;
+    }
+
+    void* logger_tables() const{
         return logger_;
     }
-    void set_logger(loginfo* logger) {
+    
+    void set_logger(void* logger) {
         assert(!logger_ && logger);
         logger_ = logger;
     }
@@ -296,7 +301,7 @@ class threadinfo {
         struct {
             mrcu_epoch_type gc_epoch_;
             mrcu_epoch_type perform_gc_epoch_;
-            loginfo *logger_;
+            void *logger_; // Dimos - we need to support different type of logs: the default, and the one that stores each table in separate place in the log buffer!
 
             threadinfo *next_;
             int purpose_;
