@@ -53,7 +53,6 @@ constexpr int nlogger = 10;
 
 #include "log.hh"
 
-
 #include "DB_index.hh"
 #include "DB_params.hh"
 #include "DB_profiler.hh"
@@ -68,9 +67,6 @@ constexpr int nlogger = 10;
 using namespace std;
 
 #include "TPCH_runner.hh"
-
-static logset_tables<9>* logs_tables;
-
 
 // #include "TPCH_queries.hh" at the bottom of the file so that to see the types of the structs used!!
 // the other solution is to include TPCH_queries.hh in all tpcc_d.cc, tpcc_dc.cc, etc! This one looks nicer :)
@@ -551,8 +547,8 @@ tpcc_db<DBParams>::tpcc_db(int num_whs)
 #else
         tbl_dts_.emplace_back(32/*num_districts * 2*/);
         tbl_cus_.emplace_back(999983/*num_customers * 2*/);
-        tbl_ods_.emplace_back(999983/*num_customers * 10 * 2*/, logging); // enable logging for orders table
-        tbl_ols_.emplace_back(999983/*num_customers * 100 * 2*/, logging); // enable logging for orderlines table
+        tbl_ods_.emplace_back(999983/*num_customers * 10 * 2*/, logging, 3); // enable logging for orders table. Its index in the log is 3
+        tbl_ols_.emplace_back(999983/*num_customers * 100 * 2*/, logging, 4); // enable logging for orderlines table. Its index in the log is 4
         #if TEST_HASHTABLE
         tbl_hash_ols_.emplace_back(999983/*num_customers * 100 * 2*/);
         #endif
@@ -603,13 +599,13 @@ void tpcc_db<DBParams>::thread_init_all(int runner_num) {
     for (auto& t : tbl_cus_)
         t.thread_init();
     for (auto& t : tbl_ods_)
-        t.thread_init(logging, runner_num);
+        t.thread_init(logging, runner_num); // enable logging
     #if RUN_TPCH
     tbl_sec_ods_.thread_init();
     //tbl_sec_ols_.thread_init();
     #endif
     for (auto& t : tbl_ols_)
-        t.thread_init(logging, runner_num);
+        t.thread_init(logging, runner_num); // enable logging
     for (auto& t : tbl_sts_)
         t.thread_init();
 #endif
@@ -1597,14 +1593,16 @@ public:
                 2 * 1024 * 1024, // warehouses
                 1024 * 1024 * 100, // districts
                 1024 * 1024 * 100, // customers
-                1024 * 1024 * 100, // orders
-                2 * 1024 * 1024 * 100, // orderlines
+                2* 1024 * 1024 * 100, // orders
+                10 * 1024 * 1024 * 100, // orderlines
                 1024 * 1024 * 100, // stocks
                 2 * 1024 * 1024 * 100, // new orders
                 1024 * 1024 * 100, // items
                 1024 * 1024 * 100 // histories
             };
            logs_tables = logset_tables<9>::make(nlogger, tbl_sizes);
+
+           initial_timestamp = timestamp();
         }
 
         #if TEST_HASHTABLE
@@ -1654,6 +1652,17 @@ public:
                 total_log_records+= log.cur_log_records();
             }
         }
+        else if(logging == 2){
+            for(unsigned i=0; i<nlogger; i++){
+                auto & log = logs_tables->log(i);
+                std::cout<<"Log "<<i<<":\n";
+                for (int tbl=0; tbl<9; tbl++){
+                    std::cout<<"\tTable "<<tbl <<" size: "<< (float)log.current_size(tbl) / 1024 <<"KB\n";
+                    total_log_sz+= (float)log.current_size(tbl) / 1024 / 1024;
+                }
+                total_log_records+= log.cur_log_records();
+            }
+        }
         std::cout<<"Total log records: "<< total_log_records <<std::endl;
         std::cout<<"Total log size (MB): "<< total_log_sz <<std::endl;
 
@@ -1685,6 +1694,8 @@ public:
 
         if(logging==1) 
             logset::free(logs);
+        else if(logging==2)
+            logset_tables<9>::free(logs_tables);
 
         //std::cout<<"Done!\n";
         return 0;
