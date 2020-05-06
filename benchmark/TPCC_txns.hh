@@ -65,11 +65,13 @@ void tpcc_runner<DBParams>::run_txn_neworder() {
 
     size_t starts = 0;
 
+    #if ADD_TO_LOG_AFTER_TXN
     Str ok_str; // we need to know which k/v are about to be inserted in the transaction, so that to apply to log only if transaction commits!
     Str ov_str;
     Str olk_str[15]; // up to 15 orderlines. We should keep track of all of them and apply to the log if transaction commits successfully!
     Str olv_str[15];
     // the actual size is num_items, but it is generated dynamically and we can'y allocate an array :)
+    #endif
 
     // begin txn
     RWTXN {
@@ -212,8 +214,10 @@ void tpcc_runner<DBParams>::run_txn_neworder() {
     std::tie(abort, result) = db.tbl_orders(q_w_id).insert_row(ok, ov, false);
     //std::cout<<"Should add log\n";
     CHK(abort);
+    #if ADD_TO_LOG_AFTER_TXN
     ok_str = Str(ok);
     ov_str = Str(*ov);
+    #endif
     assert(!result);
 #endif
 
@@ -360,8 +364,10 @@ void tpcc_runner<DBParams>::run_txn_neworder() {
         std::tie(abort, result) = db.tbl_orderlines(q_w_id).insert_row(olk, olv, false);
         //std::cout<<"Should add log\n";
         CHK(abort);
+        #if ADD_TO_LOG_AFTER_TXN
         olk_str[i] = Str(olk);
         olv_str[i] = Str(*olv);
+        #endif
         assert(!result);
 #endif
 
@@ -979,11 +985,13 @@ void tpcc_runner<DBParams>::run_txn_delivery(uint64_t q_w_id,
 
     size_t starts = 0;
 
+    #if ADD_TO_LOG_AFTER_TXN
     Str orow_str[10];
     Str ov_str[10];
     Str olrow_str[10][15];
     Str olv_str[10][15];
     uint64_t ol_cnt_cp[10];
+    #endif
 
     TXP_INCREMENT(txp_tpcc_dl_stage1);
 
@@ -1058,7 +1066,9 @@ void tpcc_runner<DBParams>::run_txn_delivery(uint64_t q_w_id,
         uint64_t q_c_id = ov->o_c_id;
         assert(q_c_id != 0);
         auto ol_cnt = ov->o_ol_cnt;
+        #if ADD_TO_LOG_AFTER_TXN
         ol_cnt_cp[q_d_id-1] = ol_cnt;
+        #endif
 
         if (Commute) {
             commutators::Commutator<order_value> commutator(carrier_id);
@@ -1069,8 +1079,10 @@ void tpcc_runner<DBParams>::run_txn_delivery(uint64_t q_w_id,
             new_ov->o_carrier_id = carrier_id;
             db.tbl_orders(q_w_id).update_row(row, new_ov);
             //std::cout<<"Should add log\n";
+            #if ADD_TO_LOG_AFTER_TXN
             orow_str[q_d_id-1] = Str(ok);
             ov_str[q_d_id-1] = Str(*new_ov);
+            #endif
         }
 #endif
 
@@ -1129,8 +1141,10 @@ void tpcc_runner<DBParams>::run_txn_delivery(uint64_t q_w_id,
                 new_olv->ol_delivery_d = delivery_date;
                 db.tbl_orderlines(q_w_id).update_row(row, new_olv);
                 //std::cout<<"Should add log\n";
+                #if ADD_TO_LOG_AFTER_TXN
                 olrow_str[q_d_id-1][ol_num-1] = Str(olk);
                 olv_str[q_d_id-1][ol_num-1] = Str(*new_olv);
+                #endif
             }
 #endif
         }
