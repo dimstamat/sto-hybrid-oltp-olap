@@ -7,8 +7,6 @@
 #define TPCC_OBSERVE_C_BALANCE 1
 #endif
 
-#define ADD_TO_LOG_AFTER_TXN 0
-
 namespace tpcc {
 
 template <typename DBParams>
@@ -64,14 +62,6 @@ void tpcc_runner<DBParams>::run_txn_neworder() {
     (void) out_brand_generic;
 
     size_t starts = 0;
-
-    #if ADD_TO_LOG_AFTER_TXN
-    Str ok_str; // we need to know which k/v are about to be inserted in the transaction, so that to apply to log only if transaction commits!
-    Str ov_str;
-    Str olk_str[15]; // up to 15 orderlines. We should keep track of all of them and apply to the log if transaction commits successfully!
-    Str olv_str[15];
-    // the actual size is num_items, but it is generated dynamically and we can'y allocate an array :)
-    #endif
 
     // begin txn
     RWTXN {
@@ -214,10 +204,6 @@ void tpcc_runner<DBParams>::run_txn_neworder() {
     std::tie(abort, result) = db.tbl_orders(q_w_id).insert_row(ok, ov, false);
     //std::cout<<"Should add log\n";
     CHK(abort);
-    #if ADD_TO_LOG_AFTER_TXN
-    ok_str = Str(ok);
-    ov_str = Str(*ov);
-    #endif
     assert(!result);
 #endif
 
@@ -364,10 +350,6 @@ void tpcc_runner<DBParams>::run_txn_neworder() {
         std::tie(abort, result) = db.tbl_orderlines(q_w_id).insert_row(olk, olv, false);
         //std::cout<<"Should add log\n";
         CHK(abort);
-        #if ADD_TO_LOG_AFTER_TXN
-        olk_str[i] = Str(olk);
-        olv_str[i] = Str(*olv);
-        #endif
         assert(!result);
 #endif
 
@@ -379,21 +361,6 @@ void tpcc_runner<DBParams>::run_txn_neworder() {
     // commit txn
     // retry until commits
     } TEND(true);
-
-    #if ADD_TO_LOG_AFTER_TXN
-    // Now it's safe to add to log, since txn committed!
-    loginfo::query_times qtimes;
-    qtimes.ts = db.tbl_orders(q_w_id).commit_tid;
-    qtimes.prev_ts = 0;
-    //std::cout<<"Log add put orders\n";
-    db.tbl_orders(q_w_id).log_add(logcmd_put, ok_str, ov_str, qtimes);
-    for(uint64_t i=0; i<num_items; i++){
-        //std::cout<<"Log add put orderlines\n";
-        db.tbl_orderlines(q_w_id).log_add(logcmd_put, olk_str[i], olv_str[i], qtimes);
-    }
-    #endif
-
-
 
     TXP_INCREMENT(txp_tpcc_no_commits);
     TXP_ACCOUNT(txp_tpcc_no_aborts, starts - 1);
@@ -985,14 +952,6 @@ void tpcc_runner<DBParams>::run_txn_delivery(uint64_t q_w_id,
 
     size_t starts = 0;
 
-    #if ADD_TO_LOG_AFTER_TXN
-    Str orow_str[10];
-    Str ov_str[10];
-    Str olrow_str[10][15];
-    Str olv_str[10][15];
-    uint64_t ol_cnt_cp[10];
-    #endif
-
     TXP_INCREMENT(txp_tpcc_dl_stage1);
 
     RWTXN {
@@ -1066,9 +1025,6 @@ void tpcc_runner<DBParams>::run_txn_delivery(uint64_t q_w_id,
         uint64_t q_c_id = ov->o_c_id;
         assert(q_c_id != 0);
         auto ol_cnt = ov->o_ol_cnt;
-        #if ADD_TO_LOG_AFTER_TXN
-        ol_cnt_cp[q_d_id-1] = ol_cnt;
-        #endif
 
         if (Commute) {
             commutators::Commutator<order_value> commutator(carrier_id);
@@ -1078,11 +1034,6 @@ void tpcc_runner<DBParams>::run_txn_delivery(uint64_t q_w_id,
             order_value *new_ov = Sto::tx_alloc(ov);
             new_ov->o_carrier_id = carrier_id;
             db.tbl_orders(q_w_id).update_row(row, new_ov);
-            //std::cout<<"Should add log\n";
-            #if ADD_TO_LOG_AFTER_TXN
-            orow_str[q_d_id-1] = Str(ok);
-            ov_str[q_d_id-1] = Str(*new_ov);
-            #endif
         }
 #endif
 
@@ -1140,11 +1091,6 @@ void tpcc_runner<DBParams>::run_txn_delivery(uint64_t q_w_id,
                 orderline_value *new_olv = Sto::tx_alloc(olv);
                 new_olv->ol_delivery_d = delivery_date;
                 db.tbl_orderlines(q_w_id).update_row(row, new_olv);
-                //std::cout<<"Should add log\n";
-                #if ADD_TO_LOG_AFTER_TXN
-                olrow_str[q_d_id-1][ol_num-1] = Str(olk);
-                olv_str[q_d_id-1][ol_num-1] = Str(*new_olv);
-                #endif
             }
 #endif
         }
@@ -1197,27 +1143,6 @@ void tpcc_runner<DBParams>::run_txn_delivery(uint64_t q_w_id,
     }
 
     } TEND(true);
-
-    #if ADD_TO_LOG_AFTER_TXN
-    loginfo::query_times qtimes;
-    qtimes.ts = db.tbl_orders(q_w_id).commit_tid;
-    qtimes.prev_ts = db.tbl_orders(q_w_id).prev_commit_tid;
-    for (uint64_t i=0; i<10; i++){
-        //std::cout<<"Log add modify orders\n";
-        db.tbl_orders(q_w_id).log_add(logcmd_modify, orow_str[i], ov_str[i], qtimes);
-    }
-    for (uint64_t i=0; i<10; i++) // d_id
-        for(uint64_t j=0; j<ol_cnt_cp[i]; j++){ // orderline num
-            //if(olrow_str[i][j].length() == 0){
-            //    std::cout<<"Key "<< olrow_str[i][j] <<" is 0! " << (j+1) <<" out of "<<  ol_cnt_cp[i] <<" orderlines\n";
-            //}
-            //if(olv_str[i][j].length() == 0){
-            //    std::cout<<"Value of "<< olrow_str[i][j] <<" is 0! " << (j+1) <<" out of "<<  ol_cnt_cp[i] <<" orderlines\n";
-            //}
-            //std::cout<<"Log add modify orderlines\n";
-            db.tbl_orderlines(q_w_id).log_add(logcmd_modify, olrow_str[i][j], olv_str[i][j], qtimes);
-        }
-    #endif
 
     last_delivered = delivered_order_ids;
 
