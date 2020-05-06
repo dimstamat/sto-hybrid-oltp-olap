@@ -8,7 +8,6 @@ static logset_tables<9>* logs_tables;
 
 // 1 for cleanup, 2 for install
 #define ADD_TO_LOG 1
-#define ADD_TO_LOG_AFTER_TXN_ 0
 
 namespace bench {
 template <typename K, typename V, typename DBParams>
@@ -750,11 +749,6 @@ public:
         }
     }
 
-    #if ADD_TO_LOG_AFTER_TXN_
-    // store commit tid and prev_commit tid for adding to log in TPCC_txns.hh
-    uint64_t commit_tid, prev_commit_tid;
-    #endif
-
     void install(TransItem& item, Transaction& txn) override {
         assert(!is_internode(item));
 
@@ -776,12 +770,6 @@ public:
                 else if (logging == 2)
                     log_add_internal_tables(item, e);
             }
-        #endif
-
-        #if ADD_TO_LOG_AFTER_TXN_
-        // store commit tid and prev_commit tid for adding to log in TPCC_txns.hh
-        commit_tid = TThread::txn->commit_tid();
-        prev_commit_tid = TThread::txn->prev_commit_tid();
         #endif
 
         if (key.is_row_item()) {
@@ -1691,11 +1679,6 @@ public:
             return result;
         }
     }
-
-    #if ADD_TO_LOG_AFTER_TXN_
-    // store commit tid and prev_commit tid for adding to log in TPCC_txns.hh
-    uint64_t commit_tid, prev_commit_tid;
-    #endif
 
     void install(TransItem& item, Transaction&) override {
         assert(!is_internode(item));
