@@ -4,7 +4,7 @@
 #include <sstream>
 
 static logset* logs;
-
+static logset_tables<9>* logs_tables;
 
 // 1 for cleanup, 2 for install
 #define ADD_TO_LOG 1
@@ -19,6 +19,8 @@ class ordered_index : public TObject {
     // 1 : default logging - one log per thread
     // 2 : one log per thread per table
     short logging = 0;
+    // the index of this table in the log buffer
+    int tbl_index_ = -1;
 
 public:
     typedef K key_type;
@@ -101,17 +103,19 @@ public:
 
     static __thread typename table_params::threadinfo_type *ti;
 
-    ordered_index(size_t init_size) : logging(0) {
+    ordered_index(size_t init_size) : logging(0), tbl_index_(-1) {
         this->table_init();
         (void)init_size;
     }
-    ordered_index() : logging(0) {
+    ordered_index() : logging(0), tbl_index_(-1) {
         this->table_init();
     }
 
-    ordered_index(size_t init_size, short logging) : logging(logging) {
+    // tbl_index: the index of this table in the log buffer
+    ordered_index(size_t init_size, short logging, int tbl_index) : logging(logging), tbl_index_(tbl_index) {
         this->table_init();
         (void)init_size;
+        assert(tbl_index>=0);  //&& tbl_index <= logs_tables->log(runner_num). getNumTables ?? )
     }
 
 
@@ -139,10 +143,14 @@ public:
         };
         // Dimos - logging
         if(logging == 1){
-            if(!ti->logger() && logs != nullptr){ // make sure logs are initialized (they are only initialized once the TPC-C benchmark starts running ; they are not initialized during the prepopulation phase)
+            if(!ti->logger() && logs){ // make sure logs are initialized (they are only initialized once the TPC-C benchmark starts running ; they are not initialized during the prepopulation phase)
                 //std::cout<<"Thread "<< TThread::id() <<": "<<runner_num<<std::endl;
                 ti->set_logger(&logs->log(runner_num));
             }
+        }
+        else if(logging == 2){
+            if(!ti->logger_tables() && logs_tables)
+                ti->set_logger(&logs_tables->log(runner_num));
         }
     }
 
@@ -274,11 +282,11 @@ public:
         // this will update the thread_info->ts_
         //qtimes.ts = ti->update_timestamp(vers);
         //qtimes.prev_ts = vers;
-        if (loginfo* log = ti->logger()) {
+        /*if (loginfo* log = ti->logger()) {
             log->acquire();
             qtimes.epoch = global_log_epoch;
             ti->logger()->record(cmd, qtimes, key, val);
-        }
+        }*/
     }
 
     void update_row(uintptr_t rid, value_type *new_row) {
@@ -688,6 +696,33 @@ public:
         }
     }
 
+    inline void log_add_internal_tables(TransItem& item, internal_elem* e){
+        logcommand cmd;
+        if(has_insert(item)){
+            cmd = logcmd_put;
+        } else if(has_delete(item)){
+            cmd = logcmd_remove;
+        } else {
+            cmd = logcmd_modify;
+        }
+        // assign timestamp
+        loginfo_tables<9>::query_times qtimes;
+        qtimes.ts = TThread::txn->commit_tid();
+        qtimes.prev_ts =  ( !has_insert(item) && !(has_delete(item)) ? TThread::txn->prev_commit_tid() : 0 );
+        if (ti->logger_tables()) {
+            reinterpret_cast<loginfo_tables<9>*>(ti->logger_tables())->acquire();
+            qtimes.epoch = global_log_epoch;
+            value_type* valp;
+            if(has_insert(item)){
+                valp = &e->row_container.row;
+            }
+            else{
+                valp = item.template raw_write_value<value_type*>();
+            }
+            reinterpret_cast<loginfo_tables<9>*>(ti->logger_tables())->record(cmd, qtimes, Str(e->key), Str(*valp), tbl_index_);
+        }
+    }
+
     inline void log_add_internal(TransItem& item, internal_elem* e){
         logcommand cmd;
         if(has_insert(item)){
@@ -701,8 +736,8 @@ public:
         loginfo::query_times qtimes;
         qtimes.ts = TThread::txn->commit_tid();
         qtimes.prev_ts =  ( !has_insert(item) && !(has_delete(item)) ? TThread::txn->prev_commit_tid() : 0 );
-        if (loginfo* log = ti->logger()) {
-            log->acquire();
+        if ( ti->logger() ) {
+            ti->logger()->acquire();
             qtimes.epoch = global_log_epoch;
             value_type* valp;
             if(has_insert(item)){
@@ -711,7 +746,6 @@ public:
             else{
                 valp = item.template raw_write_value<value_type*>();
             }
-            //std::cout<<"Add log\n";
             ti->logger()->record(cmd, qtimes, Str(e->key), Str(*valp));
         }
     }
@@ -736,8 +770,12 @@ public:
         auto e = key.internal_elem_ptr();
 
         #if ADD_TO_LOG == 2
-            if(logging > 0 && has_log_add(item))
-                log_add_internal(item, e);
+            if(logging > 0 && has_log_add(item)){
+                if(logging == 1)
+                    log_add_internal(item, e);
+                else if (logging == 2)
+                    log_add_internal_tables(item, e);
+            }
         #endif
 
         #if ADD_TO_LOG_AFTER_TXN_
@@ -831,7 +869,10 @@ public:
         if(logging > 0 && committed && has_log_add(item)){
             auto key = item.key<item_key_t>();
             auto e = key.internal_elem_ptr();
-            log_add_internal(item, e);
+            if(logging ==1)
+                log_add_internal(item, e);
+            else if( logging==2)
+                log_add_internal_tables(item, e);
         }
         #endif
         
@@ -1092,6 +1133,8 @@ template <typename K, typename V, typename DBParams>
 class mvcc_ordered_index : public TObject {
 
     short logging = 0;
+    // the index of this table in the log buffer
+    int tbl_index_=0;
 
 public:
     typedef K key_type;
@@ -1158,17 +1201,19 @@ public:
 
     static __thread typename table_params::threadinfo_type *ti;
 
-    mvcc_ordered_index(size_t init_size) : logging(0) {
+    mvcc_ordered_index(size_t init_size) : logging(0), tbl_index_(-1) {
         this->table_init();
         (void)init_size;
     }
-    mvcc_ordered_index() : logging(0) {
+    mvcc_ordered_index() : logging(0), tbl_index_(-1){
         this->table_init();
     }
 
-    mvcc_ordered_index(size_t init_size, short logging) : logging(logging) {
+    // tbl_index: the index of this table in the log buffer
+    mvcc_ordered_index(size_t init_size, short logging, int tbl_index) : logging(logging), tbl_index_(tbl_index) {
         this->table_init();
         (void)init_size;
+        assert(tbl_index>=0);  //&& tbl_index <= logs_tables->log(runner_num). getNumTables ?? )
     }
 
     void table_init() {
@@ -1195,9 +1240,13 @@ public:
         };
         // Dimos - logging
         if(logging == 1){
-            if(!ti->logger() && logs != nullptr){ // make sure logs are initialized (they are only initialized once the TPC-C benchmark starts running ; they are not initialized during the prepopulation phase)
+            if(!ti->logger() && logs){ // make sure logs are initialized (they are only initialized once the TPC-C benchmark starts running ; they are not initialized during the prepopulation phase)
                 ti->set_logger(&logs->log(runner_num));
             }
+        }
+        else if(logging == 2){
+            if(!ti->logger_tables() && logs_tables)
+                ti->set_logger(&logs_tables->log(runner_num));
         }
     }
 
