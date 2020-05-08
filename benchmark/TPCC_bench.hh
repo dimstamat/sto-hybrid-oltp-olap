@@ -33,7 +33,7 @@ static uint64_t DB_size=0;
 // 0: no logging
 // 1: default log - one log per thread
 // 2: one log per thread per table
-constexpr short logging = 1;
+constexpr short logging = 2;
 #endif
 
 constexpr int nlogger = 10;
@@ -206,10 +206,10 @@ class tpcc_access;
 template <typename DBParams>
 class tpcc_db {
 public:
-    template <typename K, typename V>
+    template <typename K, typename V, short LOG=0>
     using OIndex = typename std::conditional<DBParams::MVCC,
           mvcc_ordered_index<K, V, DBParams>,
-          ordered_index<K, V, DBParams>>::type;
+          ordered_index<K, V, DBParams, LOG>>::type;
 
 #if TPCC_HASH_INDEX
     template <typename K, typename V>
@@ -246,13 +246,13 @@ public:
     typedef UIndex<warehouse_key, warehouse_value>       wh_table_type;
     typedef UIndex<district_key, district_value>         dt_table_type;
     typedef UIndex<customer_key, customer_value>         cu_table_type;
-    typedef OIndex<order_key, order_value>               od_table_type;
+    typedef OIndex<order_key, order_value, logging>               od_table_type;
 #if RUN_TPCH
     // secondary index for <o_entry_d, order_value*>
     typedef OIndex<order_sec_key, order_sec_value>       od_sec_entry_d_type;
     //typedef OIndex<orderline_sec_key, orderline_sec_value> ol_sec_deliv_d_type;
 #endif
-    typedef OIndex<orderline_key, orderline_value>       ol_table_type;
+    typedef OIndex<orderline_key, orderline_value, logging>       ol_table_type;
     #if TEST_HASHTABLE
     typedef UIndex<orderline_key, orderline_value_deliv_d> ol_hashtable_type;
     #endif
@@ -547,8 +547,8 @@ tpcc_db<DBParams>::tpcc_db(int num_whs)
 #else
         tbl_dts_.emplace_back(32/*num_districts * 2*/);
         tbl_cus_.emplace_back(999983/*num_customers * 2*/);
-        tbl_ods_.emplace_back(999983/*num_customers * 10 * 2*/, logging, 3); // enable logging for orders table. Its index in the log is 3
-        tbl_ols_.emplace_back(999983/*num_customers * 100 * 2*/, logging, 4); // enable logging for orderlines table. Its index in the log is 4
+        tbl_ods_.emplace_back(999983/*num_customers * 10 * 2*/, 3); // enable logging for orders table. Its index in the log is 3
+        tbl_ols_.emplace_back(999983/*num_customers * 100 * 2*/, 4); // enable logging for orderlines table. Its index in the log is 4
         #if TEST_HASHTABLE
         tbl_hash_ols_.emplace_back(999983/*num_customers * 100 * 2*/);
         #endif
@@ -599,13 +599,13 @@ void tpcc_db<DBParams>::thread_init_all(int runner_num) {
     for (auto& t : tbl_cus_)
         t.thread_init();
     for (auto& t : tbl_ods_)
-        t.thread_init(logging, runner_num); // enable logging
+        t.thread_init(runner_num); // enable logging
     #if RUN_TPCH
     tbl_sec_ods_.thread_init();
     //tbl_sec_ols_.thread_init();
     #endif
     for (auto& t : tbl_ols_)
-        t.thread_init(logging, runner_num); // enable logging
+        t.thread_init(runner_num); // enable logging
     for (auto& t : tbl_sts_)
         t.thread_init();
 #endif
@@ -967,6 +967,7 @@ void tpcc_prepopulator<DBParams>::run() {
     always_assert(warehouse_id >= 1, "prepopulator warehouse id range error");
     // set affinity so that the warehouse is filled at the corresponding numa node
     //set_affinity(worker_id - 1);
+    // Dimos - for NUMA-aware placement we want to have different worker_id than warehouse id! Now we could selectively choose in which NUMA node to place the DB!
     set_affinity(worker_id);
 
     if (worker_id == filler_thread) {
@@ -1532,6 +1533,16 @@ public:
         if (ret != 0)
             return ret;
 
+        // Set thread affinity for main thread 
+        if(db_numa_node>0){ // NUMA-aware
+            // get CPUs of the specified NUMA node
+            auto & cpus = topo_info.cpu_id_list[db_numa_node];
+            set_affinity(cpus[0]); // start filler thread from the first CPU of the desired NUMA node
+        }
+        else{
+            set_affinity(0);
+        }
+
         std::cout << "Selected workload mix: " << std::string(workload_mix_names[mix]) << std::endl;
 
         auto profiler_mode = counter_mode ?
@@ -1590,17 +1601,17 @@ public:
         else if(logging == 2){
             // 9 tables here
             std::vector<int> tbl_sizes = {
-                2 * 1024 * 1024, // warehouses
-                1024 * 1024 * 100, // districts
-                1024 * 1024 * 100, // customers
+                1024 * 1024, // warehouses
+                1024 * 1024 * 50, // districts
+                1024 * 1024 * 50, // customers
                 2* 1024 * 1024 * 100, // orders
-                10 * 1024 * 1024 * 100, // orderlines
-                1024 * 1024 * 100, // stocks
-                2 * 1024 * 1024 * 100, // new orders
+                14 * 1024 * 1024 * 100, // orderlines
+                1024 * 1024, // stocks
+                1024 * 1024 * 100, // new orders
                 1024 * 1024 * 100, // items
-                1024 * 1024 * 100 // histories
+                1024 * 1024 * 100// histories
             };
-           logs_tables = logset_tables<9>::make(nlogger, tbl_sizes);
+           logs_tbl = logset_tbl<9>::make(nlogger, tbl_sizes);
 
            initial_timestamp = timestamp();
         }
@@ -1654,7 +1665,7 @@ public:
         }
         else if(logging == 2){
             for(unsigned i=0; i<nlogger; i++){
-                auto & log = logs_tables->log(i);
+                auto & log = logs_tbl->log(i);
                 std::cout<<"Log "<<i<<":\n";
                 for (int tbl=0; tbl<9; tbl++){
                     std::cout<<"\tTable "<<tbl <<" size: "<< (float)log.current_size(tbl) / 1024 <<"KB\n";
@@ -1695,7 +1706,7 @@ public:
         if(logging==1) 
             logset::free(logs);
         else if(logging==2)
-            logset_tables<9>::free(logs_tables);
+            logset_tbl<9>::free(logs_tbl);
 
         //std::cout<<"Done!\n";
         return 0;
