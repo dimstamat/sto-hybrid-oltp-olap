@@ -206,10 +206,10 @@ class tpcc_access;
 template <typename DBParams>
 class tpcc_db {
 public:
-    template <typename K, typename V, short LOG=0>
+    template <typename K, typename V>
     using OIndex = typename std::conditional<DBParams::MVCC,
           mvcc_ordered_index<K, V, DBParams>,
-          ordered_index<K, V, DBParams, LOG>>::type;
+          ordered_index<K, V, DBParams>>::type;
 
 #if TPCC_HASH_INDEX
     template <typename K, typename V>
@@ -246,13 +246,13 @@ public:
     typedef UIndex<warehouse_key, warehouse_value>       wh_table_type;
     typedef UIndex<district_key, district_value>         dt_table_type;
     typedef UIndex<customer_key, customer_value>         cu_table_type;
-    typedef OIndex<order_key, order_value, logging>               od_table_type;
+    typedef OIndex<order_key, order_value>               od_table_type;
 #if RUN_TPCH
     // secondary index for <o_entry_d, order_value*>
     typedef OIndex<order_sec_key, order_sec_value>       od_sec_entry_d_type;
     //typedef OIndex<orderline_sec_key, orderline_sec_value> ol_sec_deliv_d_type;
 #endif
-    typedef OIndex<orderline_key, orderline_value, logging>       ol_table_type;
+    typedef OIndex<orderline_key, orderline_value>       ol_table_type;
     #if TEST_HASHTABLE
     typedef UIndex<orderline_key, orderline_value_deliv_d> ol_hashtable_type;
     #endif
@@ -547,8 +547,8 @@ tpcc_db<DBParams>::tpcc_db(int num_whs)
 #else
         tbl_dts_.emplace_back(32/*num_districts * 2*/);
         tbl_cus_.emplace_back(999983/*num_customers * 2*/);
-        tbl_ods_.emplace_back(999983/*num_customers * 10 * 2*/, 3); // enable logging for orders table. Its index in the log is 3
-        tbl_ols_.emplace_back(999983/*num_customers * 100 * 2*/, 4); // enable logging for orderlines table. Its index in the log is 4
+        tbl_ods_.emplace_back(999983/*num_customers * 10 * 2*/, logging, 3); // enable logging for orders table. Its index in the log is 3
+        tbl_ols_.emplace_back(999983/*num_customers * 100 * 2*/, logging, 4); // enable logging for orderlines table. Its index in the log is 4
         #if TEST_HASHTABLE
         tbl_hash_ols_.emplace_back(999983/*num_customers * 100 * 2*/);
         #endif
@@ -599,13 +599,13 @@ void tpcc_db<DBParams>::thread_init_all(int runner_num) {
     for (auto& t : tbl_cus_)
         t.thread_init();
     for (auto& t : tbl_ods_)
-        t.thread_init(runner_num); // enable logging
+        t.thread_init(logging, runner_num); // enable logging
     #if RUN_TPCH
     tbl_sec_ods_.thread_init();
     //tbl_sec_ols_.thread_init();
     #endif
     for (auto& t : tbl_ols_)
-        t.thread_init(runner_num); // enable logging
+        t.thread_init(logging, runner_num); // enable logging
     for (auto& t : tbl_sts_)
         t.thread_init();
 #endif
