@@ -6,8 +6,6 @@
 static logset* logs;
 static logset_tbl<9>* logs_tbl;
 
-// 1 for cleanup, 2 for install
-#define ADD_TO_LOG 2
 
 namespace bench {
 template <typename K, typename V, typename DBParams>
@@ -127,7 +125,7 @@ public:
     }
 
     static void thread_init(){
-        thread_init(false, 0);
+        thread_init(0, 0);
     }
 
     // runner_num: the number of this thread [0-num_runners), since it can be different than TThread::id()!
@@ -1213,7 +1211,7 @@ public:
     }
 
     static void thread_init(){
-        thread_init(false, 0);
+        thread_init(0, 0);
     }
 
     // runner_num: the number of this thread [0-num_runners), since it can be different than TThread::id()!
