@@ -20,7 +20,7 @@ static double latencies_hashtable_lookup[1][2];
 #endif
 
 #if RUN_TPCH
-constexpr short logging = 0;
+#define LOGGING 0
 constexpr unsigned tpch_thrs_size = 10; // the number of TPCH runner threads
 
 #if MEASURE_LATENCIES
@@ -33,10 +33,13 @@ static uint64_t DB_size=0;
 // 0: no logging
 // 1: default log - one log per thread
 // 2: one log per thread per table
-constexpr short logging = 2;
+#define LOGGING 2
 #endif
 
 constexpr int nlogger = 10;
+
+// 1 for cleanup, 2 for install
+#define ADD_TO_LOG (LOGGING>0? 2 : 0)
 
 #include "barrier.hh" // pthread_barrier_t
 
@@ -547,8 +550,8 @@ tpcc_db<DBParams>::tpcc_db(int num_whs)
 #else
         tbl_dts_.emplace_back(32/*num_districts * 2*/);
         tbl_cus_.emplace_back(999983/*num_customers * 2*/);
-        tbl_ods_.emplace_back(999983/*num_customers * 10 * 2*/, logging, 3); // enable logging for orders table. Its index in the log is 3
-        tbl_ols_.emplace_back(999983/*num_customers * 100 * 2*/, logging, 4); // enable logging for orderlines table. Its index in the log is 4
+        tbl_ods_.emplace_back(999983/*num_customers * 10 * 2*/, LOGGING, 3); // enable logging for orders table. Its index in the log is 3
+        tbl_ols_.emplace_back(999983/*num_customers * 100 * 2*/, LOGGING, 4); // enable logging for orderlines table. Its index in the log is 4
         #if TEST_HASHTABLE
         tbl_hash_ols_.emplace_back(999983/*num_customers * 100 * 2*/);
         #endif
@@ -599,13 +602,13 @@ void tpcc_db<DBParams>::thread_init_all(int runner_num) {
     for (auto& t : tbl_cus_)
         t.thread_init();
     for (auto& t : tbl_ods_)
-        t.thread_init(logging, runner_num); // enable logging
+        t.thread_init(LOGGING, runner_num); // enable logging
     #if RUN_TPCH
     tbl_sec_ods_.thread_init();
     //tbl_sec_ols_.thread_init();
     #endif
     for (auto& t : tbl_ols_)
-        t.thread_init(logging, runner_num); // enable logging
+        t.thread_init(LOGGING, runner_num); // enable logging
     for (auto& t : tbl_sts_)
         t.thread_init();
 #endif
@@ -1593,12 +1596,12 @@ public:
 
 
         // Dimos - enable logging
-        if(logging == 1) {
+        if(LOGGING == 1) {
             logs = logset::make(nlogger);
             // TODO: initiali_timestamp should be related to the txn commit TID, since qtimes.ts is the commit TID of the current txn.
             initial_timestamp = timestamp();
         }
-        else if(logging == 2){
+        else if(LOGGING == 2){
             // 9 tables here
             std::vector<int> tbl_sizes = {
                 1024 * 1024, // warehouses
@@ -1654,7 +1657,7 @@ public:
 
         float total_log_sz=0;
         int total_log_records = 0;
-        if(logging==1){
+        if(LOGGING==1){
             // inspect log:
             for(unsigned i=0; i<nlogger; i++){
                 auto & log = logs->log(i);
@@ -1663,7 +1666,7 @@ public:
                 total_log_records+= log.cur_log_records();
             }
         }
-        else if(logging == 2){
+        else if(LOGGING == 2){
             for(unsigned i=0; i<nlogger; i++){
                 auto & log = logs_tbl->log(i);
                 std::cout<<"Log "<<i<<":\n";
@@ -1703,9 +1706,9 @@ public:
             Transaction::tinfo[i].rcu_set.release_all();
         }
 
-        if(logging==1) 
+        if(LOGGING==1) 
             logset::free(logs);
-        else if(logging==2)
+        else if(LOGGING==2)
             logset_tbl<9>::free(logs_tbl);
 
         //std::cout<<"Done!\n";
