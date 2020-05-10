@@ -10,7 +10,7 @@
 
 
 #include "../util/measure_latencies.hh"
-s
+
 #define RUN_TPCH 0
 #define RUN_TPCC 1
 #define TEST_HASHTABLE 0
