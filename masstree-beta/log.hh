@@ -22,8 +22,9 @@
 #include <pthread.h>
 #include "misc.hh"
 
+#include <unordered_map>
+
 #define MEASURE_LOG_RECORDS 0
-#define LOG_PER_TABLE 1 // support separate log per table. We will simply index the log (pointer arithmetic) to go to the log records of a specific table.  
 
 class logset;
 
@@ -31,7 +32,7 @@ using lcdf::Str;
 namespace lcdf { class Json; }
 
 template <int N_TBLS> 
-class logset_tables;
+class logset_tbl;
 
 // in-memory log.
 // more than one, to reduce contention on the lock.
@@ -58,6 +59,10 @@ class loginfo {
 
     uint32_t current_size(){
         return pos_;
+    }
+
+    char* get_buf(){ // we need the pointer to the buffer for log replay (since this log is not intended to be flushed to disk)
+        return buf_ ;
     }
 
     #if MEASURE_LOG_RECORDS
@@ -133,9 +138,19 @@ class loginfo {
     friend class logset;
 };
 
+
+/*=========================*\
+|   ONE LOG PER TABLE       |
+|===========================|
+|* Divide log buffer into  *|
+|* tables and index to get *|
+|* to the desired table.   *|
+\*_________________________*/
+// Support separate log per table. We will simply index the log (pointer arithmetic) to go to the log records of a specific table.  
+
 // in-memory log, one per thread. Buffer is indexed by table and thus we need one loginfo for all tables.
 template <int N_TBLS=1>
-class loginfo_tables {
+class loginfo_tbl {
     public:
     inline void acquire();
     inline void release();
@@ -160,6 +175,10 @@ class loginfo_tables {
         return 0;
     }
 
+    char* get_buf(uint32_t tbl){ // we need the pointer to the buffer of the given table. This will be used for log replay (since this log is not intended to be flushed to disk)
+        return buf_  + start_[tbl];
+    }
+
     private:
     struct waitlist {
         waitlist* next;
@@ -167,7 +186,7 @@ class loginfo_tables {
     struct front { // 20 bytes
         uint32_t lock_;
         waitlist* waiting_;
-        logset_tables<N_TBLS>* logset_;
+        logset_tbl<N_TBLS>* logset_;
     };
     struct logset_info {
         int32_t size_;
@@ -180,14 +199,15 @@ class loginfo_tables {
     uint32_t records_num_; // Dimos - number of log records currently stored
     char padding1_[CACHE_LINE_SIZE - sizeof(front) - 4* sizeof(kvepoch_t) - sizeof(uint32_t)]; // subtract the size of records_num_ also!
     #else
-    char padding1_[CACHE_LINE_SIZE - sizeof(front) - 4* sizeof(kvepoch_t)]; // we can fit all these in one cache line.
+    // we don't need quiescent, wake, flushed for in-memory log
+    char padding1_[CACHE_LINE_SIZE - sizeof(front) - 1* sizeof(kvepoch_t)]; // we can fit all these in one cache line.
     #endif
 
     kvepoch_t log_epoch_;       // epoch written to log (non-quiescent)
     // TODO: might not needed since we don't flush this log to disk!
-    kvepoch_t quiescent_epoch_; // epoch we went quiescent
-    kvepoch_t wake_epoch_;      // epoch for which we recorded a wake command
-    kvepoch_t flushed_epoch_;   // epoch fsync()ed to disk
+    //kvepoch_t quiescent_epoch_; // epoch we went quiescent
+    //kvepoch_t wake_epoch_;      // epoch for which we recorded a wake command
+    //kvepoch_t flushed_epoch_;   // epoch fsync()ed to disk
 
 
     
@@ -207,11 +227,11 @@ class loginfo_tables {
         };
     };
 
-    loginfo_tables(logset_tables<N_TBLS>* ls, int logindex, std::vector<int>& tbl_sizes);
+    loginfo_tbl(logset_tbl<N_TBLS>* ls, int logindex, std::vector<int>& tbl_sizes);
     
-    ~loginfo_tables();
+    ~loginfo_tbl();
 
-    friend class logset_tables<N_TBLS>;
+    friend class logset_tbl<N_TBLS>;
 
 };
 
@@ -219,18 +239,18 @@ class loginfo_tables {
 
 
 template <int N_TBLS=1>
-class logset_tables{
+class logset_tbl{
   public:
-    static logset_tables* make(int size, std::vector<int>& tbl_sizes);
+    static logset_tbl* make(int size, std::vector<int>& tbl_sizes);
 
-    static void free(logset_tables* ls);
+    static void free(logset_tbl* ls);
 
     inline int size() const;
-    inline loginfo_tables<N_TBLS>& log(int i);
-    inline const loginfo_tables<N_TBLS>& log(int i) const;
+    inline loginfo_tbl<N_TBLS>& log(int i);
+    inline const loginfo_tbl<N_TBLS>& log(int i) const;
 
   private:
-    loginfo_tables<N_TBLS> li_[0];
+    loginfo_tbl<N_TBLS> li_[0];
 
 };
 
@@ -264,30 +284,82 @@ enum logcommand {
 
 
 // replay the in-memory log.
-// size is the size of the log to be played.
+// buf:         the pointer in the log buffer from where to start replaying (it could be any location within the buffer)
+// size:        the size of the log to be played, starting from buf.
+// to_epoch:    the epoch until which it should replay. When reaches an epoch greater than to_epoch, it will stop and store the location in buf.
 class logmem_replay {
     public:
     logmem_replay(char * buf, off_t size) : size_(size), buf_(buf) {}
-    ~logmem_replay();
+    ~logmem_replay(){}
 
     struct info_type {
-        kvepoch_t first_epoch;
-        kvepoch_t last_epoch;
-        kvepoch_t wake_epoch;
-        kvepoch_t min_post_quiescent_wake_epoch;
-        bool quiescent;
+        kvepoch_t to_epoch;
+        std::unordered_map<uint64_t, char*> epoch_ptr; // we need to know where each epoch starts in the buffer. That way, we don't have to traverse the entire buffer to learn about the epoch's location, but 
+        // rather learn them as we go. We need to store where each epoch starts so that next time to be able to start from that location in the buffer, rather than the beginning.
     };
 
     info_type info() const;
-    kvepoch_t min_post_quiescent_wake_epoch(kvepoch_t quiescent_epoch) const;
-
-    uint64_t replay();
+    // to_epoch: until which epoch to play the log. As soon as we encounter a log epoch greater than to_epoch, we mark the location in the buffer in epoch_ptr and return
+    template <typename Callback>
+    uint64_t replay(kvepoch_t to_epoch, Callback callback);
 
   private:
     off_t size_;
     char *buf_;
 
 };
+
+// LOG RECORD
+
+struct logmem_record {
+    uint32_t command;
+    Str key;
+    Str val;
+    kvtimestamp_t ts;
+    kvtimestamp_t prev_ts;
+    kvepoch_t epoch;
+
+    const char *extract(const char *buf, const char *end);
+};
+
+// replays the in-memory log and returns the 
+// number of entries found.
+template <typename Callback>
+uint64_t logmem_replay::replay(kvepoch_t to_epoch, Callback callback){
+    uint64_t nr = 0;
+    const char *pos = buf_, *end = buf_ + size_;
+    logmem_record lr;
+    
+    std::cout<<"Replaying log of size "<< size_ <<std::endl;
+
+    // XXX
+    while (pos < end) {
+        const char *nextpos = lr.extract(pos, end);
+        if (lr.command == logcmd_none) {
+            fprintf(stderr, "replay: %" PRIu64 " entries replayed, CORRUPT @%zu\n",
+                    nr, pos - buf_);
+            break;
+        }
+        if(lr.command == logcmd_epoch){
+            if(lr.epoch > to_epoch){ // reached to_epoch: stop playing!
+                std::cout<<"Replay reached epoch "<<to_epoch.value()<<". Stop!\n";
+                return nr;
+            }
+        }
+        if (lr.key.len) { // skip empty entry
+            if (lr.command == logcmd_put
+                || lr.command == logcmd_replace
+                || lr.command == logcmd_modify
+                || lr.command == logcmd_remove) {
+                callback(lr.key);
+            }
+            ++nr;
+        }
+        // XXX RCU
+        pos = nextpos;
+    }
+    return nr;
+}
 
 class logreplay {
   public:
@@ -477,78 +549,58 @@ inline const loginfo& logset::log(int i) const {
     return li_[i];
 }
 
+/*=============================================================================================================================*/
+
+
+/*=========================*\
+|       logset_tbl       |
+|===========================|
+|*    Implementation of    *|
+|*    logset_tbl        *|
+|*    member functions.    *|
+\*_________________________*/
 template <int N_TBLS>
-inline void loginfo_tables<N_TBLS>::acquire() {
-    test_and_set_acquire(&f_.lock_);
+logset_tbl<N_TBLS>* logset_tbl<N_TBLS>::make(int size, std::vector<int>& tbl_sizes){
+    static_assert((sizeof(loginfo_tbl<N_TBLS>) % CACHE_LINE_SIZE) == 0, "unexpected sizeof(loginfo)");
+    always_assert(N_TBLS == tbl_sizes.size(), "table sizes should be the same as N_TBLS");
+    std::cout<<"Size of loginfo_tbl: "<< sizeof(loginfo_tbl<N_TBLS>)<<std::endl;
+    assert(size > 0 && size <= 64);
+    char* x = new char[sizeof(loginfo_tbl<N_TBLS>) * size + sizeof(typename loginfo_tbl<N_TBLS>::logset_info) + CACHE_LINE_SIZE];
+    std::cout<<"size of logset_info: "<< sizeof(typename loginfo_tbl<N_TBLS>::logset_info)<<std::endl;
+    char* ls_pos = x + sizeof(typename loginfo_tbl<N_TBLS>::logset_info);
+    
+    uintptr_t left = reinterpret_cast<uintptr_t>(ls_pos) % CACHE_LINE_SIZE;
+    if (left)
+        ls_pos += CACHE_LINE_SIZE - left;
+    logset_tbl<N_TBLS>* ls = reinterpret_cast<logset_tbl<N_TBLS>*>(ls_pos);
+    ls->li_[-1].lsi_.size_ = size;
+    ls->li_[-1].lsi_.allocation_offset_ = (int) (x - ls_pos);
+    for (int i = 0; i != size; ++i)
+        new((void*) &ls->li_[i]) loginfo_tbl<N_TBLS>(ls, i, tbl_sizes);
+    return ls;
 }
 
 template <int N_TBLS>
-inline void loginfo_tables<N_TBLS>::release() {
-    test_and_set_release(&f_.lock_);
+void logset_tbl<N_TBLS>::free(logset_tbl* ls){
+    for (int i = 0; i != ls->size(); ++i)
+        ls->li_[i].~loginfo_tbl();
+    delete[] (reinterpret_cast<char*>(ls) + ls->li_[-1].lsi_.allocation_offset_);
 }
 
 template <int N_TBLS>
-inline loginfo_tables<N_TBLS>& logset_tables<N_TBLS>::log(int i){
-    assert(unsigned(i) < unsigned(size()));
-    return li_[i];
-}
-
-template <int N_TBLS>
-inline const loginfo_tables<N_TBLS>& logset_tables<N_TBLS>::log(int i) const{
-    assert(unsigned(i) < unsigned(size()));
-    return li_[i];
-}
-template <int N_TBLS>
-inline int logset_tables<N_TBLS>::size() const {
+inline int logset_tbl<N_TBLS>::size() const {
     return li_[-1].lsi_.size_;
 }
 
 
 /*=========================*\
-|       logset_tables       |
+|       loginfo_tbl      |
 |===========================|
 |*    Implementation of    *|
-|*    logset_tables        *|
-|*    member functions.    *|
+|*    loginfo_tbl.      *|
 \*_________________________*/
 template <int N_TBLS>
-logset_tables<N_TBLS>* logset_tables<N_TBLS>::make(int size, std::vector<int>& tbl_sizes){
-    static_assert((sizeof(loginfo_tables<N_TBLS>) % CACHE_LINE_SIZE) == 0, "unexpected sizeof(loginfo)");
-    always_assert(N_TBLS == tbl_sizes.size(), "table sizes should be the same as N_TBLS");
-    std::cout<<"Size of loginfo_tables: "<< sizeof(loginfo_tables<N_TBLS>)<<std::endl;
-    assert(size > 0 && size <= 64);
-    char* x = new char[sizeof(loginfo_tables<N_TBLS>) * size + sizeof(typename loginfo_tables<N_TBLS>::logset_info) + CACHE_LINE_SIZE];
-    std::cout<<"size of logset_info: "<< sizeof(typename loginfo_tables<N_TBLS>::logset_info)<<std::endl;
-    char* ls_pos = x + sizeof(typename loginfo_tables<N_TBLS>::logset_info);
-    
-    uintptr_t left = reinterpret_cast<uintptr_t>(ls_pos) % CACHE_LINE_SIZE;
-    if (left)
-        ls_pos += CACHE_LINE_SIZE - left;
-    logset_tables<N_TBLS>* ls = reinterpret_cast<logset_tables<N_TBLS>*>(ls_pos);
-    ls->li_[-1].lsi_.size_ = size;
-    ls->li_[-1].lsi_.allocation_offset_ = (int) (x - ls_pos);
-    for (int i = 0; i != size; ++i)
-        new((void*) &ls->li_[i]) loginfo_tables<N_TBLS>(ls, i, tbl_sizes);
-    return ls;
-}
-
-template <int N_TBLS>
-void logset_tables<N_TBLS>::free(logset_tables* ls){
-    for (int i = 0; i != ls->size(); ++i)
-        ls->li_[i].~loginfo_tables();
-    delete[] (reinterpret_cast<char*>(ls) + ls->li_[-1].lsi_.allocation_offset_);
-}
-
-
-
-/*=========================*\
-|       loginfo_tables      |
-|===========================|
-|*    Implementation of    *|
-|*    loginfo_tables.      *|
-\*_________________________*/
-template <int N_TBLS>
-loginfo_tables<N_TBLS>::loginfo_tables(logset_tables<N_TBLS>* ls, int logindex, std::vector<int>& tbl_sizes){
+loginfo_tbl<N_TBLS>::loginfo_tbl(logset_tbl<N_TBLS>* ls, int logindex, std::vector<int>& tbl_sizes){
     f_.lock_ = 0;
     f_.waiting_ = 0;
     #if MEASURE_LOG_RECORDS
@@ -570,11 +622,11 @@ loginfo_tables<N_TBLS>::loginfo_tables(logset_tables<N_TBLS>* ls, int logindex, 
         start_[tbl] = pos_[tbl] = tbl==0 ? 0 : (pos_[tbl-1] + len_[tbl-1]);
         //std::cout<<"Table "<< tbl<<": pos_: "<< pos_[tbl]<<", len_: "<< len_[tbl]<<std::endl;
     }
-    //std::cout<<"sizeof loginfo_tables: "<<sizeof(*this)<<std::endl;
+    //std::cout<<"sizeof loginfo_tbl: "<<sizeof(*this)<<std::endl;
     log_epoch_ = 0;
-    quiescent_epoch_ = 0;
-    wake_epoch_ = 0;
-    flushed_epoch_ = 0;
+    //quiescent_epoch_ = 0;
+    //wake_epoch_ = 0;
+    //flushed_epoch_ = 0;
 
     ti_ = 0;
     f_.logset_ = ls;
@@ -583,38 +635,63 @@ loginfo_tables<N_TBLS>::loginfo_tables(logset_tables<N_TBLS>* ls, int logindex, 
 }
 
 template <int N_TBLS>
-loginfo_tables<N_TBLS>::~loginfo_tables(){
+loginfo_tbl<N_TBLS>::~loginfo_tbl(){
     free(buf_);
+}
+
+template <int N_TBLS>
+inline void loginfo_tbl<N_TBLS>::acquire() {
+    test_and_set_acquire(&f_.lock_);
+}
+
+template <int N_TBLS>
+inline void loginfo_tbl<N_TBLS>::release() {
+    test_and_set_release(&f_.lock_);
+}
+
+template <int N_TBLS>
+inline loginfo_tbl<N_TBLS>& logset_tbl<N_TBLS>::log(int i){
+    assert(unsigned(i) < unsigned(size()));
+    return li_[i];
+}
+
+template <int N_TBLS>
+inline const loginfo_tbl<N_TBLS>& logset_tbl<N_TBLS>::log(int i) const{
+    assert(unsigned(i) < unsigned(size()));
+    return li_[i];
 }
 
 
 // tbl: The table where the log record belongs
 template <int N_TBLS>
-void loginfo_tables<N_TBLS>::record(int command, const query_times& qtimes, Str key, Str value, int tbl){
+void loginfo_tbl<N_TBLS>::record(int command, const query_times& qtimes, Str key, Str value, int tbl){
     //pos_[tbl];    the position in the buffer where the next log record for this table should be stored
     //start_[tbl];  the position in the buffer where the log records for this table start
     //len_[tbl];    the capacity of the log for this table
 
     //assert(!recovering);
+    //size_t n = logrec_kvdelta::size(key.len, value.len)
+    //    + logrec_epoch::size() + logrec_base::size();
+    // not needed for in-memory log
     size_t n = logrec_kvdelta::size(key.len, value.len)
-        + logrec_epoch::size() + logrec_base::size();
+        + logrec_epoch::size();
     waitlist wait = { &wait };
     int stalls = 0;
     while (1) {
         if ((start_[tbl]+len_[tbl]) - pos_[tbl] >= n
             && (wait.next == &wait || f_.waiting_ == &wait)) {
-            kvepoch_t we = global_wake_epoch;
+            //kvepoch_t we = global_wake_epoch;
 
             // Potentially record a new epoch.
             if (qtimes.epoch != log_epoch_) {
                 log_epoch_ = qtimes.epoch;
-                std::cout<<"log_epoch: "<< log_epoch_<<std::endl;
+                //std::cout<<"changing log_epoch to: "<< log_epoch_.value()<<std::endl;
                 pos_[tbl] += logrec_epoch::store(buf_ + pos_[tbl], logcmd_epoch, qtimes.epoch);
                 #if MEASURE_LOG_RECORDS
                 incr_cur_log_records();
                 #endif
             }
-
+            /* -- Not needed for in-memory log
             if (quiescent_epoch_) {
                 // We're recording a new log record on a log that's been
                 // quiescent for a while. If the quiescence marker has been
@@ -641,6 +718,7 @@ void loginfo_tables<N_TBLS>::record(int command, const query_times& qtimes, Str 
                 incr_cur_log_records();
                 #endif
             }
+            */
             if (command == logcmd_put && qtimes.prev_ts
                 && !(qtimes.prev_ts & 1))
                 pos_[tbl] += logrec_kvdelta::store(buf_ + pos_[tbl],
@@ -649,6 +727,7 @@ void loginfo_tables<N_TBLS>::record(int command, const query_times& qtimes, Str 
             else
                 pos_[tbl] += logrec_kv::store(buf_ + pos_[tbl],
                                          command, key, value, qtimes.ts);
+            assert(command != logcmd_none);
             #if MEASURE_LOG_RECORDS
             incr_cur_log_records();
             #endif
