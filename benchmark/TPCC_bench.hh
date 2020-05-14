@@ -34,6 +34,7 @@ static uint64_t DB_size=0;
 // 1: default log - one log per thread
 // 2: one log per thread per table
 #define LOGGING 2
+#define LOG_NTABLES 9
 #endif
 
 constexpr int nlogger = 10;
@@ -70,6 +71,9 @@ constexpr int nlogger = 10;
 using namespace std;
 
 #include "TPCH_runner.hh"
+
+extern kvepoch_t global_log_epoch;
+
 
 // #include "TPCH_queries.hh" at the bottom of the file so that to see the types of the structs used!!
 // the other solution is to include TPCH_queries.hh in all tpcc_d.cc, tpcc_dc.cc, etc! This one looks nicer :)
@@ -1129,6 +1133,8 @@ public:
         uint64_t tsc_diff = (uint64_t)(time_limit * constants::processor_tsc_frequency * constants::billion);
         auto start_t = prof.start_timestamp();
 
+        uint64_t div = 10;
+
         while (true) {
             // Executed enqueued delivery transactions, if any
             if (mix < 3) {  // no need to execute if mix 3 is selected (read-only)
@@ -1157,8 +1163,17 @@ public:
             }
 
             auto curr_t = read_tsc();
-            if ((curr_t - start_t) >= tsc_diff)
+            if ((curr_t - start_t) >= tsc_diff){
                 break;
+            }
+
+            if (LOGGING > 0){
+                if ( runner_id == 0 && div>0 && (curr_t - start_t) >= tsc_diff/div){
+                    global_log_epoch = global_log_epoch.next_nonzero();
+                    //std::cout<<"Changed epoch to "<< global_log_epoch.value()<<std::endl;
+                    div--;
+                }
+            }
 
             txn_type t = runner.next_transaction();
             switch (t) {
@@ -1600,6 +1615,7 @@ public:
             logs = logset::make(nlogger);
             // TODO: initiali_timestamp should be related to the txn commit TID, since qtimes.ts is the commit TID of the current txn.
             initial_timestamp = timestamp();
+            global_log_epoch = 1;
         }
         else if(LOGGING == 2){
             // 9 tables here
@@ -1614,9 +1630,10 @@ public:
                 1024 * 1024 * 100, // items
                 1024 * 1024 * 100// histories
             };
-           logs_tbl = logset_tbl<9>::make(nlogger, tbl_sizes);
+           logs_tbl = logset_tbl<LOG_NTABLES>::make(nlogger, tbl_sizes);
 
            initial_timestamp = timestamp();
+           global_log_epoch = 1;
         }
 
         #if TEST_HASHTABLE
@@ -1671,6 +1688,8 @@ public:
                 auto & log = logs_tbl->log(i);
                 std::cout<<"Log "<<i<<":\n";
                 for (int tbl=0; tbl<9; tbl++){
+                    if(log.current_size(tbl)==0)
+                        continue;
                     std::cout<<"\tTable "<<tbl <<" size: "<< (float)log.current_size(tbl) / 1024 <<"KB\n";
                     total_log_sz+= (float)log.current_size(tbl) / 1024 / 1024;
                 }
@@ -1679,6 +1698,75 @@ public:
         }
         std::cout<<"Total log records: "<< total_log_records <<std::endl;
         std::cout<<"Total log size (MB): "<< total_log_sz <<std::endl;
+
+        // parse the log!
+        #if 1
+        kvepoch_t to_epoch=2;
+        if (LOGGING == 1){
+            for(unsigned i=0; i<nlogger; i++){
+                auto & log = logs->log(i);
+                std::cout<<"Log "<<i<<":\n";
+                logmem_replay rep(log.get_buf(), log.current_size());
+                auto callBack = [&] (const Str& key) -> void {
+                    (void)key;
+                };
+                unsigned recs_replayed = rep.template replay<decltype(callBack)>(to_epoch, callBack);
+                std::cout<<"Replayed "<< recs_replayed << " log records\n";
+            }
+        }
+        else if(LOGGING == 2){
+            std::unordered_map<Str, unsigned> ods_keys;
+            std::unordered_map<Str, unsigned> odls_keys;
+
+            auto callBackOrders = [&ods_keys] (const Str& key) -> void {
+                if(ods_keys.count(key)>0)
+                    ods_keys[key]++;
+                else
+                    ods_keys[key]=1;
+            };
+
+            auto callBackOrderlines = [&odls_keys] (const Str& key) -> void {
+                if(odls_keys.count(key)>0)
+                    odls_keys[key]++;
+                else
+                    odls_keys[key]=1;
+            };
+
+            for(unsigned i=0; i<nlogger; i++){
+                auto & log = logs_tbl->log(i);
+                std::cout<<"Log "<<i<<":\n";
+                for (int tbl=0; tbl<9; tbl++){
+                    if(log.current_size(tbl)==0)
+                        continue;
+                    std::cout<<"Table "<< tbl<<std::endl;
+                    logmem_replay rep (log.get_buf(tbl), log.current_size(tbl));
+                    unsigned recs_replayed=0;
+                    if(tbl==3)
+                        recs_replayed = rep.template replay<decltype(callBackOrders)>(to_epoch, callBackOrders);
+                    else if (tbl==4)
+                        recs_replayed = rep.template replay<decltype(callBackOrderlines)>(to_epoch, callBackOrderlines);
+                    std::cout<<"Replayed "<< recs_replayed << " log records\n";
+                }
+            }
+
+            auto parseTab = [] (Str tabName, std::unordered_map<Str, unsigned> & tab) -> void {
+                std::cout<<"Table "<< tabName <<std::endl;
+                std::cout<<"Number of keys: "<< tab.size()<<std::endl;
+                uint64_t num_ops=0;
+                for (auto & elem : tab){
+                    //if(tabName == "Orderlines")
+                    //    std::cout<<"Times: "<< elem.second<<std::endl;
+                    num_ops+=elem.second;
+                }
+                std::cout<<"Average number of operations per key: "<< (float) num_ops/tab.size() <<std::endl;
+            };
+
+            parseTab("Orders", ods_keys);
+            parseTab("Orderlines", odls_keys);
+        }
+        #endif
+
+
 
         //std::cout<<"Size of order_value: "<<sizeof(struct order_value)<<std::endl;
         //std::cout<<"Size of orderline_value: "<<sizeof(struct orderline_value)<<std::endl;
@@ -1709,7 +1797,7 @@ public:
         if(LOGGING==1) 
             logset::free(logs);
         else if(LOGGING==2)
-            logset_tbl<9>::free(logs_tbl);
+            logset_tbl<LOG_NTABLES>::free(logs_tbl);
 
         //std::cout<<"Done!\n";
         return 0;
