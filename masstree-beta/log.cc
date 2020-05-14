@@ -45,31 +45,6 @@ kvepoch_t rec_replay_max_epoch;
 kvepoch_t rec_replay_min_quiescent_last_epoch;
 
 
-/*=========================*\
-|   ONE LOG PER TABLE       |
-|===========================|
-|* Divide log buffer into  *|
-|* tables and index to get *|
-|* to the desired table.   *|
-\*_________________________*/
-
-
-/*=========================*\
-|       logset_tables       |
-|===========================|
-|*    Implementation of    *|
-|*    logset_tables.       *|
-\*_________________________*/
-
-
-/*=========================*\
-|       loginfo_tables      |
-|===========================|
-|*    Implementation of    *|
-|*    loginfo_tables.      *|
-\*_________________________*/
-
-
 logset* logset::make(int size) {
     static_assert(sizeof(loginfo) == 2 * CACHE_LINE_SIZE, "unexpected sizeof(loginfo)");
     assert(size > 0 && size <= 64);
@@ -215,14 +190,17 @@ void* loginfo::run() {
 void loginfo::record(int command, const query_times& qtimes,
                      Str key, Str value) {
     assert(!recovering);
+    //size_t n = logrec_kvdelta::size(key.len, value.len)
+    //    + logrec_epoch::size() + logrec_base::size();
+    // not needed for in-memory log
     size_t n = logrec_kvdelta::size(key.len, value.len)
-        + logrec_epoch::size() + logrec_base::size();
+        + logrec_epoch::size();
     waitlist wait = { &wait };
     int stalls = 0;
     while (1) {
         if (len_ - pos_ >= n
             && (wait.next == &wait || f_.waiting_ == &wait)) {
-            kvepoch_t we = global_wake_epoch;
+            //kvepoch_t we = global_wake_epoch;
 
             // Potentially record a new epoch.
             if (qtimes.epoch != log_epoch_) {
@@ -233,7 +211,7 @@ void loginfo::record(int command, const query_times& qtimes,
                 incr_cur_log_records();
                 #endif
             }
-
+            /* -- Not needed for in-memory log
             if (quiescent_epoch_) {
                 // We're recording a new log record on a log that's been
                 // quiescent for a while. If the quiescence marker has been
@@ -260,6 +238,7 @@ void loginfo::record(int command, const query_times& qtimes,
                 incr_cur_log_records();
                 #endif
             }
+            */
             if (command == logcmd_put && qtimes.prev_ts
                 && !(qtimes.prev_ts & 1))
                 pos_ += logrec_kvdelta::store(buf_ + pos_,
@@ -333,6 +312,52 @@ struct logrecord {
 void logrecord::parse(){
 
 }
+
+
+
+const char *
+logmem_record::extract(const char *buf, const char *end)
+{
+    const logrec_base *lr = reinterpret_cast<const logrec_base *>(buf);
+    if (unlikely(size_t(end - buf) < sizeof(*lr)
+                 || lr->size_ < sizeof(*lr)
+                 || size_t(end - buf) < lr->size_
+                 || lr->command_ == logcmd_none)) {
+    fail:
+        command = logcmd_none;
+        return end;
+    }
+
+    command = lr->command_;
+    if (command == logcmd_put || command == logcmd_replace
+        || command == logcmd_remove) {
+        const logrec_kv *lk = reinterpret_cast<const logrec_kv *>(buf);
+        if (unlikely(lk->size_ < sizeof(*lk)
+                     || lk->keylen_ > MASSTREE_MAXKEYLEN
+                     || sizeof(*lk) + lk->keylen_ > lk->size_))
+            goto fail;
+        ts = lk->ts_;
+        key.assign(lk->buf_, lk->keylen_);
+        val.assign(lk->buf_ + lk->keylen_, lk->size_ - sizeof(*lk) - lk->keylen_);
+    } else if (command == logcmd_modify) {
+        const logrec_kvdelta *lk = reinterpret_cast<const logrec_kvdelta *>(buf);
+        if (unlikely(lk->keylen_ > MASSTREE_MAXKEYLEN
+                     || sizeof(*lk) + lk->keylen_ > lk->size_))
+            goto fail;
+        ts = lk->ts_;
+        prev_ts = lk->prev_ts_;
+        key.assign(lk->buf_, lk->keylen_);
+        val.assign(lk->buf_ + lk->keylen_, lk->size_ - sizeof(*lk) - lk->keylen_);
+    } else if (command == logcmd_epoch) {
+        const logrec_epoch *lre = reinterpret_cast<const logrec_epoch *>(buf);
+        if (unlikely(lre->size_ < logrec_epoch::size()))
+            goto fail;
+        epoch = lre->epoch_;
+    }
+
+    return buf + lr->size_;
+}
+
 
 const char *
 logrecord::extract(const char *buf, const char *end)
@@ -487,51 +512,6 @@ inline void logrecord::apply(row_type*& value, bool found,
         } else
             break;
     }
-}
-
-
-
-// replays the in-memory log and returns the 
-// number of entries found.
-uint64_t logmem_replay::replay(){
-    uint64_t nr = 0;
-    const char *pos = buf_, *end = buf_ + size_;
-    const char *repbegin = 0, *repend = 0;
-    logrecord lr;
-    std::vector<lcdf::Json> jrepo;
-
-    std::cout<<"Replaying log of size "<< size_ <<std::endl;
-
-    // XXX
-    while (pos < end) {
-        const char *nextpos = lr.extract(pos, end);
-        if (lr.command == logcmd_none) {
-            fprintf(stderr, "replay: %" PRIu64 " entries replayed, CORRUPT @%zu\n",
-                    nr, pos - buf_);
-            break;
-        }
-        
-        // replay only part of log after checkpoint
-        // could replay everything, the if() here tests
-        // correctness of checkpoint scheme.
-        assert(repbegin);
-        repend = nextpos;
-        if (lr.key.len) { // skip empty entry
-            if (lr.command == logcmd_put
-                || lr.command == logcmd_replace
-                || lr.command == logcmd_modify
-                || lr.command == logcmd_remove)
-                lr.parse();
-                //lr.run(tree->table(), jrepo, *ti);
-            ++nr;
-            if (nr % 100000 == 0)
-                fprintf(stderr,
-                        "replay : %" PRIu64 " entries replayed\n", nr);
-        }
-        // XXX RCU
-        pos = nextpos;
-    }
-    return nr;
 }
 
 // replay
