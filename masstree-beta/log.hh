@@ -24,7 +24,20 @@
 
 #include <unordered_map>
 
+#include "../benchmark/DB_params.hh"
+
 #define MEASURE_LOG_RECORDS 0
+
+#ifndef LOG_NTABLES // should be defined in TPCC_bench.hh
+#define LOG_NTABLES 0
+#endif
+
+// 1 for std::unordered_map
+// 2 for STO Uindex (non-transactional)
+#define MAP 1
+#define STD_MAP (MAP == 1 || LOG_NTABLES == 0) // if LOG_NTABLES is not set, then use default std::unordered_map since STO UIndex is not defined! (That's when we include log.hh from different files)
+#define STO_MAP (MAP == 2 && LOG_NTABLES > 0)
+
 
 class logset;
 
@@ -33,6 +46,9 @@ namespace lcdf { class Json; }
 
 template <int N_TBLS> 
 class logset_tbl;
+
+template <int N_TBLS>
+class logset_map;
 
 // in-memory log.
 // more than one, to reduce contention on the lock.
@@ -138,6 +154,82 @@ class loginfo {
     friend class logset;
 };
 
+struct logrec {
+    enum class NamedColumn : int { 
+        cmd = 0, val, epoch, ts, next
+    };
+    uint32_t command;
+    Str val;
+    kvepoch_t epoch;
+    kvtimestamp_t ts;
+    logrec* next;
+
+    logrec() : command(0), val(""), epoch(0), ts(0), next(0) {}
+    logrec(uint32_t cmd, Str v, kvepoch_t e, kvtimestamp_t t, logrec* n): command(cmd), val(v), epoch(e), ts(t), next(n) {}
+};
+
+template <int N_TBLS=1>
+class loginfo_map {
+  public:
+    // logging
+    struct query_times {
+        kvepoch_t epoch;
+        kvtimestamp_t ts;
+        kvtimestamp_t prev_ts;
+    };
+
+    struct logset_info {
+        int32_t size_;
+        int allocation_offset_;
+    };
+    
+    loginfo_map(int logindex);
+    ~loginfo_map();
+
+    void record(int command, const query_times& qt, Str key, Str value, int tbl);
+
+    uint32_t current_size(int tbl){
+        (void)tbl;
+        return 0;
+    }
+
+    uint32_t cur_log_records(int tbl){
+        #if STD_MAP
+        return map[tbl].size();
+        #elif STO_MAP
+        return map[tbl].nbuckets();
+        #endif
+    }
+
+    private:
+
+    #if STD_MAP
+    typedef std::unordered_map<Str, logrec> logmap_t;
+    #elif STO_MAP
+    typedef bench::unordered_index<Str, logrec, db_params::db_default_params> logmap_t;
+    #endif
+    
+    logmap_t map [N_TBLS]; // N_TBLS * 56
+
+    char cache_line_2_ [ ((N_TBLS * sizeof(logmap_t) + 2*sizeof(threadinfo*) )  % CACHE_LINE_SIZE  > 0? (CACHE_LINE_SIZE -  (N_TBLS * sizeof(logmap_t) + 2*sizeof(threadinfo*) )  % CACHE_LINE_SIZE) : 0) ];
+
+    union { // 32 bytes
+        struct { // 12 bytes
+            threadinfo *ti_;
+            int logindex_;
+            //logmap_t * map [N_TBLS]; //N_TBLS * 8 bytes
+        };
+        struct {
+            //char cache_line_2_[ ((sizeof(threadinfo*) + sizeof(int) + N_TBLS * sizeof(std::unordered_map<Str, logrec>)) / CACHE_LINE_SIZE ) * CACHE_LINE_SIZE +
+            // ((sizeof(threadinfo*) + sizeof(int) + N_TBLS * sizeof(std::unordered_map<Str, logrec>)) % CACHE_LINE_SIZE == 0? /* 0 */ CACHE_LINE_SIZE : CACHE_LINE_SIZE) - sizeof(logset_info) ];
+            // the compiler assigns more memory sometimes in order to automatically align by cache line. This makes it occupy more memory than the calculated one! Thus, give it on more cache line always.
+            logset_info lsi_;
+        };
+    };
+
+    friend class logset_map<N_TBLS>;
+
+};
 
 /*=========================*\
 |   ONE LOG PER TABLE       |
@@ -222,7 +314,9 @@ class loginfo_tbl {
             int logindex_;
         };
         struct {
-            char cache_line_2_ [ ((sizeof(char*) + sizeof(threadinfo*) + sizeof(int)+ 3 * sizeof(uint32_t) * N_TBLS)/CACHE_LINE_SIZE) * CACHE_LINE_SIZE + CACHE_LINE_SIZE - sizeof(logset_info)];
+            char cache_line_2_ [ ((sizeof(char*) + sizeof(threadinfo*) + sizeof(int)+ 3 * sizeof(uint32_t) * N_TBLS)/CACHE_LINE_SIZE) * CACHE_LINE_SIZE + 
+            ((sizeof(char*) + sizeof(threadinfo*) + sizeof(int)+ 3 * sizeof(uint32_t) * N_TBLS) % CACHE_LINE_SIZE == 0? /* 0 */ CACHE_LINE_SIZE: CACHE_LINE_SIZE) - sizeof(logset_info)];
+            // the compiler assigns more memory sometimes in order to automatically align by cache line. This makes it occupy more memory than the calculated one! Thus, give it on more cache line always.
             logset_info lsi_; // 8 bytes
         };
     };
@@ -236,10 +330,13 @@ class loginfo_tbl {
 };
 
 
+class logset_base {
+
+};
 
 
 template <int N_TBLS=1>
-class logset_tbl{
+class logset_tbl : public logset_base {
   public:
     static logset_tbl* make(int size, std::vector<int>& tbl_sizes);
 
@@ -254,7 +351,7 @@ class logset_tbl{
 
 };
 
-class logset {
+class logset  : public logset_base {
   public:
     static logset* make(int size);
     static void free(logset* ls);
@@ -265,6 +362,20 @@ class logset {
 
   private:
     loginfo li_[0];
+};
+
+template<int N_TBLS=1>
+class logset_map: public logset_base {
+  public:
+    static logset_map<N_TBLS>* make(int size);
+    static void free(logset_map<N_TBLS>* ls);
+
+    inline int size() const;
+    inline loginfo_map<N_TBLS>& log(int i);
+    inline const loginfo_map<N_TBLS>& log(int i) const;
+
+  private:
+    loginfo_map<N_TBLS> li_[0];
 };
 
 extern kvepoch_t global_log_epoch;
@@ -549,7 +660,113 @@ inline const loginfo& logset::log(int i) const {
     return li_[i];
 }
 
+
 /*=============================================================================================================================*/
+
+/*=========================*\
+|       loginfo_map         |
+|===========================|
+|*    Implementation of    *|
+|*    loginfo_map          *|
+|*    member functions.    *|
+\*_________________________*/
+template <int N_TBLS>
+loginfo_map<N_TBLS>::loginfo_map(int logindex) {
+    for(int i=0; i<N_TBLS; i++)
+        map[i] = loginfo_map<N_TBLS>::logmap_t(1024 * 1024);
+    ti_ = 0;
+    logindex_ = logindex;
+}
+
+template <int N_TBLS>
+loginfo_map<N_TBLS>::~loginfo_map(){
+
+}
+template <int N_TBLS>
+void loginfo_map<N_TBLS>::record(int command, const loginfo_map<N_TBLS>::query_times& qt, Str key, Str value, int tbl){
+    auto & m = map[tbl];
+    #if STD_MAP
+    auto elem = m.find(key);
+    if( elem!= m.end()){ // found - check epoch!
+        logrec& rec = elem->second;
+        if(rec.epoch < qt.epoch){ // new log record has a newer epoch than existing log record! Create a new one and chain it! - we expect to only have up to 2 elements in the chain since the log drainer creates new epoch and once done we can discard the older epochs.
+            logrec * newrec = new logrec(command, value, qt.epoch, qt.ts, nullptr);
+            rec.next = newrec;
+        }
+    }
+    else {
+        m[key] = logrec(command, value, qt.epoch, qt.ts, nullptr);
+    }
+    #elif STO_MAP
+    auto * elem = m.nontrans_get(key);
+    if (elem != nullptr){ // found - check epoch!
+        if(elem->epoch < qt.epoch){
+            logrec * newrec = new logrec(command, value, qt.epoch, qt.ts, nullptr);
+            elem->next = newrec;
+        }
+    }
+    else{
+        m.nontrans_put(key, logrec(command, value, qt.epoch, qt.ts, nullptr));
+    }
+
+    #endif
+}
+
+
+
+template <int N_TBLS>
+inline loginfo_map<N_TBLS>& logset_map<N_TBLS>::log(int i) {
+    assert(unsigned(i) < unsigned(size()));
+    return li_[i];
+}
+template <int N_TBLS>
+inline const loginfo_map<N_TBLS>& logset_map<N_TBLS>::log(int i) const {
+    assert(unsigned(i) < unsigned(size()));
+    return li_[i];
+}
+
+
+
+/*=========================*\
+|       logset_map          |
+|===========================|
+|*    Implementation of    *|
+|*    logset_map           *|
+|*    member functions.    *|
+\*_________________________*/
+
+template <int N_TBLS>
+logset_map<N_TBLS>* logset_map<N_TBLS>::make(int size){
+    assert(size > 0 && size <= 64);
+    static_assert((sizeof(loginfo_map<N_TBLS>) % CACHE_LINE_SIZE)==0, "unexpected size of loginfo_map");
+    std::cout<<"Size of loginfo_map: "<< sizeof(loginfo_map<N_TBLS>)<<std::endl;
+    
+    char* x = new char[sizeof(loginfo_map<N_TBLS>) * size + sizeof(typename loginfo_map<N_TBLS>::logset_info) + CACHE_LINE_SIZE];
+    char* ls_pos = x + sizeof(typename loginfo_map<N_TBLS>::logset_info);
+    uintptr_t left = reinterpret_cast<uintptr_t>(ls_pos) % CACHE_LINE_SIZE;
+    if (left)
+        ls_pos += CACHE_LINE_SIZE - left;
+    logset_map<N_TBLS>* ls = reinterpret_cast<logset_map<N_TBLS>*>(ls_pos);
+    ls->li_[-1].lsi_.size_ = size;
+    ls->li_[-1].lsi_.allocation_offset_ = (int) (x - ls_pos);
+    for (int i = 0; i != size; ++i)
+        new((void*) &ls->li_[i]) loginfo_map<N_TBLS>(i);
+    std::cout<<"Size of loginfo_map: "<< sizeof(loginfo_map<N_TBLS>)<<std::endl;
+    return ls;
+}
+
+template <int N_TBLS>
+void logset_map<N_TBLS>::free(logset_map<N_TBLS>* ls){
+    for (int i = 0; i != ls->size(); ++i)
+        ls->li_[i].~loginfo_map();
+    delete[] (reinterpret_cast<char*>(ls) + ls->li_[-1].lsi_.allocation_offset_);
+}
+
+template <int N_TBLS>
+inline int logset_map<N_TBLS>::size() const{
+    return li_[-1].lsi_.size_;
+}
+
 
 
 /*=========================*\
@@ -563,10 +780,9 @@ template <int N_TBLS>
 logset_tbl<N_TBLS>* logset_tbl<N_TBLS>::make(int size, std::vector<int>& tbl_sizes){
     static_assert((sizeof(loginfo_tbl<N_TBLS>) % CACHE_LINE_SIZE) == 0, "unexpected sizeof(loginfo)");
     always_assert(N_TBLS == tbl_sizes.size(), "table sizes should be the same as N_TBLS");
-    std::cout<<"Size of loginfo_tbl: "<< sizeof(loginfo_tbl<N_TBLS>)<<std::endl;
+    //std::cout<<"Size of loginfo_tbl: "<< sizeof(loginfo_tbl<N_TBLS>)<<std::endl;
     assert(size > 0 && size <= 64);
     char* x = new char[sizeof(loginfo_tbl<N_TBLS>) * size + sizeof(typename loginfo_tbl<N_TBLS>::logset_info) + CACHE_LINE_SIZE];
-    std::cout<<"size of logset_info: "<< sizeof(typename loginfo_tbl<N_TBLS>::logset_info)<<std::endl;
     char* ls_pos = x + sizeof(typename loginfo_tbl<N_TBLS>::logset_info);
     
     uintptr_t left = reinterpret_cast<uintptr_t>(ls_pos) % CACHE_LINE_SIZE;
