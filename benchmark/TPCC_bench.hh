@@ -33,7 +33,8 @@ static uint64_t DB_size=0;
 // 0: no logging
 // 1: default log - one log per thread
 // 2: one log per thread per table
-#define LOGGING 2
+// 3: std::unordered_map for log
+#define LOGGING 3
 #define LOG_NTABLES 9
 #endif
 
@@ -55,12 +56,12 @@ constexpr int nlogger = 10;
 #include "TPCC_selectors.hh"
 #endif
 
-#include "log.hh"
-
 #include "DB_index.hh"
 #include "DB_params.hh"
 #include "DB_profiler.hh"
 #include "PlatformFeatures.hh"
+
+#include "log.hh"
 
 #define A_GEN_CUSTOMER_ID           1023
 #define A_GEN_ITEM_ID               8191
@@ -1169,6 +1170,7 @@ public:
 
             if (LOGGING > 0){
                 if ( runner_id == 0 && div>0 && (curr_t - start_t) >= tsc_diff/div){
+                    // slow if we do e.next_nonzero() and then e.value()! Either do e.next_nonzero() and don't get the value, or do e++ and e.value().
                     global_log_epoch = global_log_epoch.next_nonzero();
                     //std::cout<<"Changed epoch to "<< global_log_epoch.value()<<std::endl;
                     div--;
@@ -1630,10 +1632,13 @@ public:
                 1024 * 1024 * 100, // items
                 1024 * 1024 * 100// histories
             };
-           logs_tbl = logset_tbl<LOG_NTABLES>::make(nlogger, tbl_sizes);
-
+           logs = logset_tbl<LOG_NTABLES>::make(nlogger, tbl_sizes);
+           
            initial_timestamp = timestamp();
            global_log_epoch = 1;
+        }
+        else if(LOGGING == 3){
+            logs = logset_map<LOG_NTABLES>::make(nlogger);
         }
 
         #if TEST_HASHTABLE
@@ -1677,7 +1682,7 @@ public:
         if(LOGGING==1){
             // inspect log:
             for(unsigned i=0; i<nlogger; i++){
-                auto & log = logs->log(i);
+                auto & log = (reinterpret_cast<logset*>(logs))->log(i);
                 std::cout<<"Log "<<i<<" size: " << log.cur_log_records()<<", " << (float)log.current_size() / 1024 <<"KB\n";
                 total_log_sz+= (float)log.current_size() / 1024 / 1024;
                 total_log_records+= log.cur_log_records();
@@ -1685,9 +1690,9 @@ public:
         }
         else if(LOGGING == 2){
             for(unsigned i=0; i<nlogger; i++){
-                auto & log = logs_tbl->log(i);
+                auto & log = (reinterpret_cast<logset_tbl<LOG_NTABLES>*>(logs))->log(i);
                 std::cout<<"Log "<<i<<":\n";
-                for (int tbl=0; tbl<9; tbl++){
+                for (int tbl=0; tbl<LOG_NTABLES; tbl++){
                     if(log.current_size(tbl)==0)
                         continue;
                     std::cout<<"\tTable "<<tbl <<" size: "<< (float)log.current_size(tbl) / 1024 <<"KB\n";
@@ -1696,15 +1701,28 @@ public:
                 total_log_records+= log.cur_log_records();
             }
         }
+        else if (LOGGING == 3){
+            for(unsigned i=0; i<nlogger; i++){
+                auto & log = (reinterpret_cast<logset_map<LOG_NTABLES>*>(logs))->log(i);
+                std::cout<<"Log "<<i<<":\n";
+                for (int tbl=0; tbl<LOG_NTABLES; tbl++){
+                    if(log.current_size(tbl)==0 && log.cur_log_records(tbl)==0)
+                        continue;
+                    std::cout<<"\tTable "<<tbl <<" size: "<< (float)log.current_size(tbl) / 1024 <<"KB\n";
+                    total_log_sz+= (float)log.current_size(tbl) / 1024 / 1024;
+                    total_log_records+= log.cur_log_records(tbl);
+                }
+            }
+        }
         std::cout<<"Total log records: "<< total_log_records <<std::endl;
         std::cout<<"Total log size (MB): "<< total_log_sz <<std::endl;
 
         // parse the log!
-        #if 1
+        #if 0
         kvepoch_t to_epoch=2;
         if (LOGGING == 1){
             for(unsigned i=0; i<nlogger; i++){
-                auto & log = logs->log(i);
+                auto & log = (reinterpret_cast<logset*>(logs))->log(i);
                 std::cout<<"Log "<<i<<":\n";
                 logmem_replay rep(log.get_buf(), log.current_size());
                 auto callBack = [&] (const Str& key) -> void {
@@ -1733,9 +1751,9 @@ public:
             };
 
             for(unsigned i=0; i<nlogger; i++){
-                auto & log = logs_tbl->log(i);
+                auto & log = (reinterpret_cast<logset_tbl<LOG_NTABLES>*>(logs))->log(i);
                 std::cout<<"Log "<<i<<":\n";
-                for (int tbl=0; tbl<9; tbl++){
+                for (int tbl=0; tbl<LOG_NTABLES; tbl++){
                     if(log.current_size(tbl)==0)
                         continue;
                     std::cout<<"Table "<< tbl<<std::endl;
@@ -1795,9 +1813,9 @@ public:
         }
 
         if(LOGGING==1) 
-            logset::free(logs);
+            logset::free(reinterpret_cast<logset*>(logs));
         else if(LOGGING==2)
-            logset_tbl<LOG_NTABLES>::free(logs_tbl);
+            logset_tbl<LOG_NTABLES>::free(reinterpret_cast<logset_tbl<LOG_NTABLES>*>(logs));
 
         //std::cout<<"Done!\n";
         return 0;
