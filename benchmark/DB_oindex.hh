@@ -1,10 +1,17 @@
 #pragma once
 
+namespace bench {
+template <typename K, typename V, typename DBParams>
+class unordered_index ;
+};
+
 #include "log.hh"
 #include <sstream>
 
-static logset* logs;
-static logset_tbl<9>* logs_tbl;
+static logset_base* logs;
+#ifndef LOG_NTABLES // should be defined in TPCC_bench.hh
+#define LOG_NTABLES 0
+#endif
 
 
 namespace bench {
@@ -15,6 +22,7 @@ class ordered_index : public TObject {
     // 0 : no logging
     // 1 : default logging - one log per thread
     // 2 : one log per thread per table
+    // 3 : one std::unordered_map per thread per table
     short logging = 0;
     // the index of this table in the log buffer when we choose one log per thread per table
     int tbl_index_ = -1;
@@ -142,12 +150,16 @@ public:
         if(logging == 1){
             if(!ti->logger() && logs){ // make sure logs are initialized (they are only initialized once the TPC-C benchmark starts running ; they are not initialized during the prepopulation phase)
                 //std::cout<<"Thread "<< TThread::id() <<": "<<runner_num<<std::endl;
-                ti->set_logger(&logs->log(runner_num));
+                ti->set_logger(& (reinterpret_cast<logset*>(logs))->log(runner_num));
             }
         }
         else if(logging == 2){
-            if(!ti->logger_tbl() && logs_tbl)
-                ti->set_logger(&logs_tbl->log(runner_num));
+            if(!ti->logger_tbl() && logs)
+                ti->set_logger(& (reinterpret_cast<logset_tbl<LOG_NTABLES>*>(logs))->log(runner_num));
+        }
+        else if (logging == 3){
+            if(!ti->logger_tbl() && logs)
+                ti->set_logger(& (reinterpret_cast<logset_map<LOG_NTABLES>*>(logs))->log(runner_num));
         }
     }
 
@@ -366,7 +378,7 @@ public:
             // cannot add to log here - what if we abort!?
             // add to log on cleanup! Just mark it now!
             #if ADD_TO_LOG > 0
-            if(logging > 0){
+            if(logging > 0 && overwrite){
                 row_item.add_flags(log_add_bit);
             }
             #endif
@@ -700,14 +712,15 @@ public:
         } else if(has_delete(item)){
             cmd = logcmd_remove;
         } else {
-            cmd = logcmd_modify;
+            cmd = logcmd_replace;
         }
         // assign timestamp
-        loginfo_tbl<9>::query_times qtimes;
+        loginfo_tbl<LOG_NTABLES>::query_times qtimes;
         qtimes.ts = TThread::txn->commit_tid();
         qtimes.prev_ts =  ( !has_insert(item) && !(has_delete(item)) ? TThread::txn->prev_commit_tid() : 0 );
         if (ti->logger_tbl()) {
-            reinterpret_cast<loginfo_tbl<9>*>(ti->logger_tbl())->acquire();
+            if(logging == 2)
+                reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(ti->logger_tbl())->acquire();
             qtimes.epoch = global_log_epoch;
             value_type* valp;
             if(has_insert(item)){
@@ -716,7 +729,15 @@ public:
             else{
                 valp = item.template raw_write_value<value_type*>();
             }
-            reinterpret_cast<loginfo_tbl<9>*>(ti->logger_tbl())->record(cmd, qtimes, Str(e->key), Str(*valp), tbl_index_);
+            if(logging == 2)
+                reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(ti->logger_tbl())->record(cmd, qtimes, Str(e->key), Str(*valp), tbl_index_);
+            else if(logging == 3){
+                loginfo_map<LOG_NTABLES>::query_times qt;
+                qt.epoch = qtimes.epoch;
+                qt.prev_ts = qtimes.prev_ts;
+                qt.ts = qtimes.ts;
+                reinterpret_cast<loginfo_map<LOG_NTABLES>*>(ti->logger_tbl())->record(cmd, qt, Str(e->key), Str(*valp), tbl_index_);
+            }
         }
     }
 
@@ -727,7 +748,7 @@ public:
         } else if(has_delete(item)){
             cmd = logcmd_remove;
         } else {
-            cmd = logcmd_modify;
+            cmd = logcmd_replace;
         }
         // assign timestamp
         loginfo::query_times qtimes;
@@ -765,7 +786,7 @@ public:
             if(logging > 0 && has_log_add(item)){
                 if(logging == 1)
                     log_add_internal(item, e);
-                else if (logging == 2)
+                else if (logging == 2 || logging == 3)
                     log_add_internal_tbl(item, e);
             }
         #endif
@@ -857,7 +878,7 @@ public:
             auto e = key.internal_elem_ptr();
             if(logging ==1)
                 log_add_internal(item, e);
-            else if( logging==2)
+            else if( logging==2 || logging == 3)
                 log_add_internal_tbl(item, e);
         }
         #endif
@@ -1227,12 +1248,16 @@ public:
         // Dimos - logging
         if(logging == 1){
             if(!ti->logger() && logs){ // make sure logs are initialized (they are only initialized once the TPC-C benchmark starts running ; they are not initialized during the prepopulation phase)
-                ti->set_logger(&logs->log(runner_num));
+                ti->set_logger(& (reinterpret_cast<logset*>(logs))->log(runner_num));
             }
         }
         else if(logging == 2){
-            if(!ti->logger_tbl() && logs_tbl)
-                ti->set_logger(&logs_tbl->log(runner_num));
+            if(!ti->logger_tbl() && logs)
+                ti->set_logger(&(reinterpret_cast<logset_tbl<LOG_NTABLES>*>(logs))->log(runner_num));
+        }
+        else if(logging == 3){
+            if(!ti->logger_tbl() && logs)
+                ti->set_logger(&(reinterpret_cast<logset_map<LOG_NTABLES>*>(logs))->log(runner_num));
         }
     }
 
