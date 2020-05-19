@@ -105,6 +105,11 @@ public:
         map_.resize(size);
     }
 
+    // Dimos - we need an empty constructor for the log! -> see log.hh
+    unordered_index(Hash h = Hash(), Pred p = Pred()) :
+            map_(), hasher_(h), pred_(p), key_gen_(0) {
+    }
+
     inline size_t hash(const key_type& k) const {
         return hasher_(k);
     }
