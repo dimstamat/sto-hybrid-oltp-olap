@@ -97,7 +97,9 @@ struct warehouse_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-
+    lcdf::Str to_str() {
+        return "";
+    }
     uint64_t w_id;
 };
 
@@ -148,6 +150,9 @@ struct warehouse_value {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
+    lcdf::Str to_str() {
+        return "";
+    }
 };
 #endif
 
@@ -167,7 +172,9 @@ struct district_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-
+    lcdf::Str to_str() {
+        return "";
+    }
     uint64_t d_w_id;
     uint64_t d_id;
 };
@@ -223,6 +230,9 @@ struct district_value {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
+    lcdf::Str to_str() {
+        return "";
+    }
 };
 #endif
 
@@ -258,7 +268,9 @@ struct customer_idx_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-
+    lcdf::Str to_str() {
+        return "";
+    }
     uint64_t c_w_id;
     uint64_t c_d_id;
     char c_last[16];
@@ -275,6 +287,9 @@ struct customer_idx_value {
     // Dimos: add Str() in order to add the value in the log
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
+    }
+    lcdf::Str to_str() {
+        return "";
     }
 };
 
@@ -298,7 +313,9 @@ struct customer_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-
+    lcdf::Str to_str() {
+        return "";
+    }
     uint64_t get_c_id() const {
         return bswap(c_id);
     }
@@ -399,6 +416,9 @@ struct customer_value {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
+    lcdf::Str to_str() {
+        return "";
+    }
 };
 #endif
 
@@ -449,6 +469,9 @@ struct history_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
+    lcdf::Str to_str() {
+        return "";
+    }
     uint32_t w_id;
     uint32_t d_id;
     uint64_t c_id;
@@ -479,6 +502,9 @@ struct history_value {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
+    lcdf::Str to_str() {
+        return "";
+    }
 };
 
 // ORDER
@@ -506,7 +532,9 @@ struct order_cidx_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-
+    lcdf::Str to_str() {
+        return "";
+    }
     uint64_t o_w_id;
     uint64_t o_d_id;
     uint64_t o_c_id;
@@ -539,6 +567,10 @@ struct order_key {
     }
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
+    }
+    lcdf::Str to_str() const { // used by the log to compress and only store the actual length, rather than the entire size of the struct!
+        std::string s = std::to_string(bswap(o_w_id)) + "," + std::to_string(bswap(o_d_id)) + "," + std::to_string(bswap(o_id));
+        return lcdf::Str(s.c_str());
     }
 
     wdid_type o_w_id;
@@ -581,7 +613,10 @@ struct order_value{
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    
+    lcdf::Str to_str() const { // used by the log to compress and only store the actual length, rather than the entire size of the struct!
+        std::string s = std::to_string(o_c_id) + "," +  std::to_string(o_carrier_id) + "," + std::to_string(o_entry_d) + "," + std::to_string(o_ol_cnt) + "," + std::to_string(o_all_local);
+        return lcdf::Str(s.c_str());
+    }
 };
 #endif
 
@@ -699,6 +734,10 @@ struct orderline_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
+    lcdf::Str to_str() const {
+        std::string s = std::to_string(bswap(ol_w_id)) + "," + std::to_string(bswap(ol_d_id)) + "," + std::to_string(bswap(ol_o_id)) + "," + std::to_string(bswap(ol_number));
+        return lcdf::Str(s.c_str());
+    }
 
     uint64_t ol_w_id;
     uint64_t ol_d_id;
@@ -745,6 +784,11 @@ struct orderline_value {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
+    lcdf::Str to_str() {
+        std::string s = std::to_string(ol_i_id) + "," + std::to_string(ol_supply_w_id) + "," + std::to_string(ol_delivery_d) + "," + std::to_string(ol_quantity) +
+         "," + std::to_string(ol_amount) + "," + std::string(ol_dist_info);
+        return lcdf::Str(s.c_str());
+    }
 };
 #endif
 
@@ -779,7 +823,9 @@ struct item_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-
+    lcdf::Str to_str() {
+        return "";
+    }
     uint64_t i_id;
 };
 
@@ -796,6 +842,9 @@ struct item_value {
     // Dimos: add Str() in order to add the value in the log
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
+    }
+    lcdf::Str to_str() {
+        return "";
     }
 };
 
@@ -820,7 +869,9 @@ struct stock_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-
+    lcdf::Str to_str() {
+        return "";
+    }
     uint64_t s_w_id;
     uint64_t s_i_id;
 };
@@ -863,6 +914,9 @@ struct stock_value {
     // Dimos: add Str() in order to add the value in the log
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
+    }
+    lcdf::Str to_str() {
+        return "";
     }
 };
 #endif
