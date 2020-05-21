@@ -15,15 +15,15 @@ static logset_base* logs;
 
 
 namespace bench {
-template <typename K, typename V, typename DBParams>
+template <typename K, typename V, typename DBParams, short LOG=0>
 class ordered_index : public TObject {
 
     // Dimos - emable logging
+    // template argument LOG
     // 0 : no logging
     // 1 : default logging - one log per thread
     // 2 : one log per thread per table
     // 3 : one std::unordered_map per thread per table
-    short logging = 0;
     // the index of this table in the log buffer when we choose one log per thread per table
     int tbl_index_ = -1;
 
@@ -63,6 +63,10 @@ public:
                             !valid, v),
               deleted(false) {}
 
+        // Dimos - initialize the value type with the timestamp found when replaying the log. This is the transaction commit TID
+        internal_elem(const key_type& k, const value_type& v, uint64_t ts)
+            : key(k), row_container( ts, false, v), deleted(false) {}
+
         version_type& version() {
             return row_container.row_version();
         }
@@ -90,14 +94,14 @@ public:
     typedef typename table_type::node_type node_type;
     typedef typename unlocked_cursor_type::nodeversion_value_type nodeversion_value_type;
 
-    using column_access_t = typename split_version_helpers<ordered_index<K, V, DBParams>>::column_access_t;
-    using item_key_t = typename split_version_helpers<ordered_index<K, V, DBParams>>::item_key_t;
+    using column_access_t = typename split_version_helpers<ordered_index<K, V, DBParams, LOG>>::column_access_t;
+    using item_key_t = typename split_version_helpers<ordered_index<K, V, DBParams, LOG>>::item_key_t;
     template <typename T>
     static constexpr auto column_to_cell_accesses
-        = split_version_helpers<ordered_index<K, V, DBParams>>::template column_to_cell_accesses<T>;
+        = split_version_helpers<ordered_index<K, V, DBParams, LOG>>::template column_to_cell_accesses<T>;
     template <typename T>
     static constexpr auto extract_item_list
-        = split_version_helpers<ordered_index<K, V, DBParams>>::template extract_item_list<T>;
+        = split_version_helpers<ordered_index<K, V, DBParams, LOG>>::template extract_item_list<T>;
 
     typedef std::tuple<bool, bool, uintptr_t, const value_type*> sel_return_type;
     typedef std::tuple<bool, bool>                               ins_return_type;
@@ -108,16 +112,16 @@ public:
 
     static __thread typename table_params::threadinfo_type *ti;
 
-    ordered_index(size_t init_size) : logging(0), tbl_index_(-1) {
+    ordered_index(size_t init_size) : tbl_index_(-1) {
         this->table_init();
         (void)init_size;
     }
-    ordered_index() : logging(0), tbl_index_(-1) {
+    ordered_index() : tbl_index_(-1) {
         this->table_init();
     }
 
     // tbl_index: the index of this table in the log buffer
-    ordered_index(size_t init_size, short logging, int tbl_index) : logging(logging), tbl_index_(tbl_index) {
+    ordered_index(size_t init_size, int tbl_index) : tbl_index_(tbl_index) {
         this->table_init();
         (void)init_size;
         assert(tbl_index>=0);  //&& tbl_index <= logs_tbl->log(runner_num). getNumtbl ?? )
@@ -133,11 +137,11 @@ public:
     }
 
     static void thread_init(){
-        thread_init(0, 0);
+        thread_init(0);
     }
 
-    // runner_num: the number of this thread [0-num_runners), since it can be different than TThread::id()!
-    static void thread_init(short logging, int runner_num) {
+    // runner_num: the number of this thread [0-num_runners), since it can be different than TThread::id() - TThread::id() is the actual CPU id pinned on that thread. runner_num is from 0 to num_runners!
+    static void thread_init(int runner_num) {
         if (ti == nullptr)
             ti = threadinfo::make(threadinfo::TI_PROCESS, TThread::id());
         Transaction::tinfo[TThread::id()].trans_start_callback = []() {
@@ -147,17 +151,17 @@ public:
             ti->rcu_stop();
         };
         // Dimos - logging
-        if(logging == 1){
+        if(LOG == 1){
             if(!ti->logger() && logs){ // make sure logs are initialized (they are only initialized once the TPC-C benchmark starts running ; they are not initialized during the prepopulation phase)
                 //std::cout<<"Thread "<< TThread::id() <<": "<<runner_num<<std::endl;
                 ti->set_logger(& (reinterpret_cast<logset*>(logs))->log(runner_num));
             }
         }
-        else if(logging == 2){
+        else if(LOG == 2){
             if(!ti->logger_tbl() && logs)
                 ti->set_logger(& (reinterpret_cast<logset_tbl<LOG_NTABLES>*>(logs))->log(runner_num));
         }
-        else if (logging == 3){
+        else if (LOG == 3){
             if(!ti->logger_tbl() && logs)
                 ti->set_logger(& (reinterpret_cast<logset_map<LOG_NTABLES>*>(logs))->log(runner_num));
         }
@@ -286,8 +290,8 @@ public:
         return sel_return_type(false, false, 0, nullptr);
     }
 
-    // Dimos - enable logging - add to log
-    void log_add(enum logcommand cmd, Str& key, Str& val, loginfo::query_times& qtimes){
+    // Dimos - enable logging - add to log - called from TPCC_txns - not used for now!
+    /*void log_add_external(enum logcommand cmd, Str& key, Str& val, loginfo::query_times& qtimes){
         // this will update the thread_info->ts_
         //qtimes.ts = ti->update_timestamp(vers);
         //qtimes.prev_ts = vers;
@@ -296,7 +300,7 @@ public:
             qtimes.epoch = global_log_epoch;
             ti->logger()->record(cmd, qtimes, key, val);
         }
-    }
+    }*/
 
     void update_row(uintptr_t rid, value_type *new_row) {
         auto e = reinterpret_cast<internal_elem*>(rid);
@@ -306,7 +310,7 @@ public:
         } else {
             row_item.acquire_write(e->version(), new_row);
         }
-        if(logging>0)
+        if(LOG>0)
             row_item.add_flags(log_add_bit);
     }
 
@@ -378,7 +382,7 @@ public:
             // cannot add to log here - what if we abort!?
             // add to log on cleanup! Just mark it now!
             #if ADD_TO_LOG > 0
-            if(logging > 0 && overwrite){
+            if(LOG > 0 && overwrite){
                 row_item.add_flags(log_add_bit);
             }
             #endif
@@ -418,7 +422,7 @@ public:
             if (!update_internode_version(node, orig_nv, new_nv))
                 goto abort;
             #if ADD_TO_LOG > 0
-            if(logging > 0){
+            if(LOG > 0){
                 row_item.add_flags(log_add_bit);
             }
             #endif
@@ -666,6 +670,32 @@ public:
     }
     #endif
 
+    // If key found, perform the put only if the stored version of the internal_elem is less than the given timestamp
+    bool nontrans_put_if_ts(const key_type& k, const value_type& v, uint64_t ts){
+        cursor_type lp(table_, k);
+        bool found = lp.find_insert(*ti);
+        if (found) {
+            internal_elem *e = lp.value();
+            if(e->version() < ts){ // insert it only if the existing version is less than the given timestamp
+                if (value_is_small)
+                    e->row_container.row = v;
+                else
+                    copy_row(e, &v);
+                lp.finish(0, *ti);
+                return true;
+            }
+            else // the element found has version >= than the given timestamp, so don't insert!
+                return false;
+        }
+        else {
+            internal_elem* e = new internal_elem(k, v, ts);
+            lp.value() = e;
+            lp.finish(1, *ti);
+            return true;
+        }
+            
+    }
+
     // TObject interface methods
     bool lock(TransItem& item, Transaction &txn) override {
         assert(!is_internode(item));
@@ -705,43 +735,7 @@ public:
         }
     }
 
-    inline void log_add_internal_tbl(TransItem& item, internal_elem* e){
-        logcommand cmd;
-        if(has_insert(item)){
-            cmd = logcmd_put;
-        } else if(has_delete(item)){
-            cmd = logcmd_remove;
-        } else {
-            cmd = logcmd_replace;
-        }
-        // assign timestamp
-        loginfo_tbl<LOG_NTABLES>::query_times qtimes;
-        qtimes.ts = TThread::txn->commit_tid();
-        qtimes.prev_ts =  ( !has_insert(item) && !(has_delete(item)) ? TThread::txn->prev_commit_tid() : 0 );
-        if (ti->logger_tbl()) {
-            if(logging == 2)
-                reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(ti->logger_tbl())->acquire();
-            qtimes.epoch = global_log_epoch;
-            value_type* valp;
-            if(has_insert(item)){
-                valp = &e->row_container.row;
-            }
-            else{
-                valp = item.template raw_write_value<value_type*>();
-            }
-            if(logging == 2)
-                reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(ti->logger_tbl())->record(cmd, qtimes, Str(e->key), Str(*valp), tbl_index_);
-            else if(logging == 3){
-                loginfo_map<LOG_NTABLES>::query_times qt;
-                qt.epoch = qtimes.epoch;
-                qt.prev_ts = qtimes.prev_ts;
-                qt.ts = qtimes.ts;
-                reinterpret_cast<loginfo_map<LOG_NTABLES>*>(ti->logger_tbl())->record(cmd, qt, Str(e->key), Str(*valp), tbl_index_);
-            }
-        }
-    }
-
-    inline void log_add_internal(TransItem& item, internal_elem* e){
+    inline void log_add(TransItem& item, internal_elem* e){
         logcommand cmd;
         if(has_insert(item)){
             cmd = logcmd_put;
@@ -754,8 +748,13 @@ public:
         loginfo::query_times qtimes;
         qtimes.ts = TThread::txn->commit_tid();
         qtimes.prev_ts =  ( !has_insert(item) && !(has_delete(item)) ? TThread::txn->prev_commit_tid() : 0 );
-        if ( ti->logger() ) {
-            ti->logger()->acquire();
+        void* logger = ti->logger_tbl();
+        if(logger){
+            //TODO: no need for locks since we use one log per thread!
+            //if(LOG == 1)
+            //    reinterpret_cast<loginfo*>(logger)->acquire();
+            //if(LOG == 2)
+            //    reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(logger)->acquire();
             qtimes.epoch = global_log_epoch;
             value_type* valp;
             if(has_insert(item)){
@@ -764,7 +763,24 @@ public:
             else{
                 valp = item.template raw_write_value<value_type*>();
             }
-            ti->logger()->record(cmd, qtimes, Str(e->key), Str(*valp));
+            if(LOG == 1)
+                reinterpret_cast<loginfo*>(logger)->record(cmd, qtimes, Str(e->key), Str(*valp));
+            else if(LOG == 2){
+                // experiment with not converting to string but storing the actual key: 
+                // Not converting to string is a tiny bit better in high contention and a bit worse in low contention.
+                // Even Str() converts the struct to Str but keeps the entire size of the struct and not the actual size of the constructed string!
+                // In both cases it  writes more bytes because the size of key in orders table is 3 64-bit uints and thus occupies 24 bytes even for small numbered kes.
+                // Experiment with converting to Str (call to_str()), and then we will only write as many digits as the key. A small key would only be 3 bytes (1 digit per key part: warehouse, district, o_id).
+                //auto callback = [] (logrec_kv* lr) -> void {
+
+
+                //};
+                //reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(logger)->record(cmd, qtimes, Str(e->key), Str(*valp), tbl_index_);
+                reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(logger)->record(cmd, qtimes, e->key.to_str(), valp->to_str(), tbl_index_);
+                //reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(logger)->record(cmd, qtimes, &e->key, sizeof(e->key), valp, sizeof(value_type), tbl_index_);
+            }
+            else if(LOG == 3)
+                reinterpret_cast<loginfo_map<LOG_NTABLES>*>(logger)->record(cmd, qtimes, Str(e->key), Str(*valp), tbl_index_);
         }
     }
 
@@ -783,12 +799,8 @@ public:
         auto e = key.internal_elem_ptr();
 
         #if ADD_TO_LOG == 2
-            if(logging > 0 && has_log_add(item)){
-                if(logging == 1)
-                    log_add_internal(item, e);
-                else if (logging == 2 || logging == 3)
-                    log_add_internal_tbl(item, e);
-            }
+            if(LOG > 0 && has_log_add(item))
+                log_add(item, e);
         #endif
 
         if (key.is_row_item()) {
@@ -873,13 +885,10 @@ public:
 
     void cleanup(TransItem& item, bool committed) override {
         #if ADD_TO_LOG == 1
-        if(logging > 0 && committed && has_log_add(item)){
+        if(LOG > 0 && committed && has_log_add(item)){
             auto key = item.key<item_key_t>();
             auto e = key.internal_elem_ptr();
-            if(logging ==1)
-                log_add_internal(item, e);
-            else if( logging==2 || logging == 3)
-                log_add_internal_tbl(item, e);
+            log_add(item, e);
         }
         #endif
         
@@ -1132,14 +1141,13 @@ private:
     }
 };
 
-template <typename K, typename V, typename DBParams>
-__thread typename ordered_index<K, V, DBParams>::table_params::threadinfo_type
-*ordered_index<K, V, DBParams>::ti;
+template <typename K, typename V, typename DBParams, short LOG>
+__thread typename ordered_index<K, V, DBParams, LOG>::table_params::threadinfo_type
+*ordered_index<K, V, DBParams, LOG>::ti;
 
 template <typename K, typename V, typename DBParams>
 class mvcc_ordered_index : public TObject {
 
-    short logging = 0;
     // the index of this table in the log buffer
     int tbl_index_=0;
 
@@ -1208,16 +1216,16 @@ public:
 
     static __thread typename table_params::threadinfo_type *ti;
 
-    mvcc_ordered_index(size_t init_size) : logging(0), tbl_index_(-1) {
+    mvcc_ordered_index(size_t init_size) : tbl_index_(-1) {
         this->table_init();
         (void)init_size;
     }
-    mvcc_ordered_index() : logging(0), tbl_index_(-1){
+    mvcc_ordered_index() : tbl_index_(-1){
         this->table_init();
     }
 
     // tbl_index: the index of this table in the log buffer
-    mvcc_ordered_index(size_t init_size, short logging, int tbl_index) : logging(logging), tbl_index_(tbl_index) {
+    mvcc_ordered_index(size_t init_size, int tbl_index) : tbl_index_(tbl_index) {
         this->table_init();
         (void)init_size;
         assert(tbl_index>=0);  //&& tbl_index <= logs_tbl->log(runner_num). getNumtbl ?? )
@@ -1232,11 +1240,12 @@ public:
     }
 
     static void thread_init(){
-        thread_init(0, 0);
+        thread_init(0);
     }
 
     // runner_num: the number of this thread [0-num_runners), since it can be different than TThread::id()!
-    static void thread_init(short logging, int runner_num) {
+    static void thread_init(int runner_num) {
+        (void)runner_num;
         if (ti == nullptr)
             ti = threadinfo::make(threadinfo::TI_PROCESS, TThread::id());
         Transaction::tinfo[TThread::id()].trans_start_callback = []() {
@@ -1245,8 +1254,8 @@ public:
         Transaction::tinfo[TThread::id()].trans_end_callback = []() {
             ti->rcu_stop();
         };
-        // Dimos - logging
-        if(logging == 1){
+        // Dimos - logging - no logging in MVCC
+        /*if(logging == 1){
             if(!ti->logger() && logs){ // make sure logs are initialized (they are only initialized once the TPC-C benchmark starts running ; they are not initialized during the prepopulation phase)
                 ti->set_logger(& (reinterpret_cast<logset*>(logs))->log(runner_num));
             }
@@ -1258,7 +1267,7 @@ public:
         else if(logging == 3){
             if(!ti->logger_tbl() && logs)
                 ti->set_logger(&(reinterpret_cast<logset_map<LOG_NTABLES>*>(logs))->log(runner_num));
-        }
+        }*/
     }
 
     uint64_t gen_key() {
