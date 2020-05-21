@@ -221,6 +221,12 @@ struct dummy_row {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
+    lcdf::Str to_str() {
+        return "";
+    }
+
+
+    
 };
 
 template <typename K>
