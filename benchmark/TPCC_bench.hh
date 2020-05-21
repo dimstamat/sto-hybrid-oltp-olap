@@ -34,9 +34,11 @@ static uint64_t DB_size=0;
 // 1: default log - one log per thread
 // 2: one log per thread per table
 // 3: std::unordered_map for log
-#define LOGGING 3
+#define LOGGING 2
 #define LOG_NTABLES 9
 #endif
+
+#define REPLAY_LOG 0
 
 constexpr int nlogger = 10;
 
@@ -211,6 +213,48 @@ class tpcc_access;
 #define TPCC_HASH_INDEX 1
 #endif
 
+#if REPLAY_LOG
+class tpch_db {
+    public:
+    template <typename K, typename V>
+    using OIndex = ordered_index<K, V, db_params::db_default_params>;
+
+    typedef OIndex<order_key, order_value>               od_table_type;
+    typedef OIndex<orderline_key, orderline_value>       ol_table_type;
+
+    std::vector<od_table_type> tbl_ods_;
+    std::vector<ol_table_type> tbl_ols_;
+    
+    od_table_type& tbl_orders(uint64_t w_id){
+        return tbl_ods_[w_id - 1];
+    }
+    ol_table_type& tbl_orderlines(uint64_t w_id){
+        return tbl_ols_[w_id - 1];
+    }
+
+    void thread_init_all(){
+        for(auto& t : tbl_ods_){
+            t.thread_init();
+        }
+        for(auto& t : tbl_ols_){
+            t.thread_init();
+        }
+    }
+
+    tpch_db(int num_whs): num_whs_(num_whs) {
+        // initialize the OLAP DB
+        for(int i=0; i<num_whs; i++){
+            tbl_ods_.emplace_back(999983/*num_customers * 10 * 2*/);
+            tbl_ols_.emplace_back(999983/*num_customers * 100 * 2*/);
+        }
+    }
+    inline ~tpch_db(){}
+    private:
+        uint64_t num_whs_;
+};
+
+#endif
+
 template <typename DBParams>
 class tpcc_db {
 public:
@@ -218,6 +262,11 @@ public:
     using OIndex = typename std::conditional<DBParams::MVCC,
           mvcc_ordered_index<K, V, DBParams>,
           ordered_index<K, V, DBParams>>::type;
+
+    template <typename K, typename V>
+    using OIndexLog = typename std::conditional<DBParams::MVCC,
+          mvcc_ordered_index<K, V, DBParams>,
+          ordered_index<K, V, DBParams, LOGGING>>::type;
 
 #if TPCC_HASH_INDEX
     template <typename K, typename V>
@@ -254,13 +303,13 @@ public:
     typedef UIndex<warehouse_key, warehouse_value>       wh_table_type;
     typedef UIndex<district_key, district_value>         dt_table_type;
     typedef UIndex<customer_key, customer_value>         cu_table_type;
-    typedef OIndex<order_key, order_value>               od_table_type;
+    typedef OIndexLog<order_key, order_value>               od_table_type;
 #if RUN_TPCH
     // secondary index for <o_entry_d, order_value*>
     typedef OIndex<order_sec_key, order_sec_value>       od_sec_entry_d_type;
     //typedef OIndex<orderline_sec_key, orderline_sec_value> ol_sec_deliv_d_type;
 #endif
-    typedef OIndex<orderline_key, orderline_value>       ol_table_type;
+    typedef OIndexLog<orderline_key, orderline_value>       ol_table_type;
     #if TEST_HASHTABLE
     typedef UIndex<orderline_key, orderline_value_deliv_d> ol_hashtable_type;
     #endif
@@ -555,8 +604,8 @@ tpcc_db<DBParams>::tpcc_db(int num_whs)
 #else
         tbl_dts_.emplace_back(32/*num_districts * 2*/);
         tbl_cus_.emplace_back(999983/*num_customers * 2*/);
-        tbl_ods_.emplace_back(999983/*num_customers * 10 * 2*/, LOGGING, 3); // enable logging for orders table. Its index in the log is 3
-        tbl_ols_.emplace_back(999983/*num_customers * 100 * 2*/, LOGGING, 4); // enable logging for orderlines table. Its index in the log is 4
+        tbl_ods_.emplace_back(999983/*num_customers * 10 * 2*/, 3); // enable logging for orders table. Its index in the log is 3
+        tbl_ols_.emplace_back(999983/*num_customers * 100 * 2*/, 4); // enable logging for orderlines table. Its index in the log is 4
         #if TEST_HASHTABLE
         tbl_hash_ols_.emplace_back(999983/*num_customers * 100 * 2*/);
         #endif
@@ -607,13 +656,13 @@ void tpcc_db<DBParams>::thread_init_all(int runner_num) {
     for (auto& t : tbl_cus_)
         t.thread_init();
     for (auto& t : tbl_ods_)
-        t.thread_init(LOGGING, runner_num); // enable logging
+        t.thread_init(runner_num); // enable logging (as a template parameter earlier) and set runner_num
     #if RUN_TPCH
     tbl_sec_ods_.thread_init();
     //tbl_sec_ols_.thread_init();
     #endif
     for (auto& t : tbl_ols_)
-        t.thread_init(LOGGING, runner_num); // enable logging
+        t.thread_init(runner_num); // enable logging (as a template parameter earlier) and set runner_num
     for (auto& t : tbl_sts_)
         t.thread_init();
 #endif
@@ -1459,6 +1508,125 @@ public:
         return 0;
     }
 
+    #if REPLAY_LOG
+    static void logdrainer_thread(tpch_db& db, unsigned logdrainer_id, unsigned thread_id, kvepoch_t to_epoch){
+        std::cout<<"Logdrain thread "<< logdrainer_id <<", CPU: "<< thread_id<<std::endl;
+        set_affinity(thread_id);
+        db.thread_init_all();
+        #if LOGGING == 1
+            auto & log = (reinterpret_cast<logset*>(logs))->log(logdrainer_id);
+            logmem_replay rep(log.get_buf(), log.current_size());
+            auto callBack = [&] (const Str& key) -> void {
+                (void)key;
+            };
+            unsigned recs_replayed = rep.template replay<decltype(callBack)>(to_epoch, callBack);
+            std::cout<<"Replayed "<< recs_replayed << " log records\n";
+        #elif LOGGING == 2
+            auto & log = (reinterpret_cast<logset_tbl<LOG_NTABLES>*>(logs))->log(logdrainer_id);
+            std::cout<<"Log "<<logdrainer_id<<":\n";
+            for (int tbl=0; tbl<LOG_NTABLES; tbl++){
+                if(log.current_size(tbl)==0)
+                    continue;
+                std::cout<<"Table "<< tbl<<std::endl;
+                logmem_replay rep (log.get_buf(tbl), log.current_size(tbl));
+                unsigned recs_replayed=0;
+                auto callBack = [&db, tbl] (const Str& key, uint32_t cmd) -> void {
+                    (void)key;
+                    (void)cmd;
+                    if(cmd == logcmd_put || cmd == logcmd_modify){
+                        if(tbl==3) { // table orders
+                            //order_key k;
+                            //db.tbl_orders()
+                        }
+                        else if(tbl==4) { // table orderlines
+
+                        }
+
+                    }
+                    else if(cmd == logcmd_remove){
+
+                    }
+                    assert(cmd != logcmd_none);
+                };
+                recs_replayed = rep.template replay<decltype(callBack)>(to_epoch, callBack);
+                std::cout<<"Replayed "<< recs_replayed << " log records\n";
+            }
+        #endif
+    }
+
+    static void replay_log(int db_numa_node, kvepoch_t to_epoch, int num_warehouses){
+        std::vector<std::thread> logdrainer_thrs;
+        // start the logdrainer threads in the next NUMA node
+        unsigned logdrainer_numa = (db_numa_node+1) % topo_info.num_nodes;
+        std::cout<<"Starting log drainer threads in NUMA node "<< logdrainer_numa<<std::endl;
+        auto & cpus = topo_info.cpu_id_list[logdrainer_numa];
+
+        // set the affinity of this thread to a CPU on the OLAP numa node
+        set_affinity(cpus[0]);
+        tpch_db db(num_warehouses);
+        unsigned i=0;
+        for(auto& cpu : cpus){
+            logdrainer_thrs.emplace_back(logdrainer_thread, std::ref(db), i++, cpu, to_epoch);
+            if (i == nlogger)
+                break;
+        }
+
+        for (auto& thr : logdrainer_thrs)
+            thr.join();
+
+        #if 0
+            std::unordered_map<Str, unsigned> ods_keys;
+            std::unordered_map<Str, unsigned> odls_keys;
+
+            auto callBackOrders = [&ods_keys] (const Str& key) -> void {
+                if(ods_keys.count(key)>0)
+                    ods_keys[key]++;
+                else
+                    ods_keys[key]=1;
+            };
+
+            auto callBackOrderlines = [&odls_keys] (const Str& key) -> void {
+                if(odls_keys.count(key)>0)
+                    odls_keys[key]++;
+                else
+                    odls_keys[key]=1;
+            };
+
+            for(unsigned i=0; i<nlogger; i++){
+                auto & log = (reinterpret_cast<logset_tbl<LOG_NTABLES>*>(logs))->log(i);
+                std::cout<<"Log "<<i<<":\n";
+                for (int tbl=0; tbl<LOG_NTABLES; tbl++){
+                    if(log.current_size(tbl)==0)
+                        continue;
+                    std::cout<<"Table "<< tbl<<std::endl;
+                    logmem_replay rep (log.get_buf(tbl), log.current_size(tbl));
+                    unsigned recs_replayed=0;
+                    if(tbl==3)
+                        recs_replayed = rep.template replay<decltype(callBackOrders)>(to_epoch, callBackOrders);
+                    else if (tbl==4)
+                        recs_replayed = rep.template replay<decltype(callBackOrderlines)>(to_epoch, callBackOrderlines);
+                    std::cout<<"Replayed "<< recs_replayed << " log records\n";
+                }
+            }
+
+            auto parseTab = [] (Str tabName, std::unordered_map<Str, unsigned> & tab) -> void {
+                std::cout<<"Table "<< tabName <<std::endl;
+                std::cout<<"Number of keys: "<< tab.size()<<std::endl;
+                uint64_t num_ops=0;
+                for (auto & elem : tab){
+                    //if(tabName == "Orderlines")
+                    //    std::cout<<"Times: "<< elem.second<<std::endl;
+                    num_ops+=elem.second;
+                }
+                std::cout<<"Average number of operations per key: "<< (float) num_ops/tab.size() <<std::endl;
+            };
+
+            parseTab("Orders", ods_keys);
+            parseTab("Orderlines", odls_keys);
+        #endif
+    }
+    #endif
+
     static int execute(int argc, const char *const *argv) {
         std::cout << "*** DBParams::Id = " << DBParams::Id << std::endl;
         std::cout << "*** DBParams::Commute = " << std::boolalpha << DBParams::Commute << std::endl;
@@ -1718,72 +1886,10 @@ public:
         std::cout<<"Total log size (MB): "<< total_log_sz <<std::endl;
 
         // parse the log!
-        #if 0
-        kvepoch_t to_epoch=2;
-        if (LOGGING == 1){
-            for(unsigned i=0; i<nlogger; i++){
-                auto & log = (reinterpret_cast<logset*>(logs))->log(i);
-                std::cout<<"Log "<<i<<":\n";
-                logmem_replay rep(log.get_buf(), log.current_size());
-                auto callBack = [&] (const Str& key) -> void {
-                    (void)key;
-                };
-                unsigned recs_replayed = rep.template replay<decltype(callBack)>(to_epoch, callBack);
-                std::cout<<"Replayed "<< recs_replayed << " log records\n";
-            }
-        }
-        else if(LOGGING == 2){
-            std::unordered_map<Str, unsigned> ods_keys;
-            std::unordered_map<Str, unsigned> odls_keys;
-
-            auto callBackOrders = [&ods_keys] (const Str& key) -> void {
-                if(ods_keys.count(key)>0)
-                    ods_keys[key]++;
-                else
-                    ods_keys[key]=1;
-            };
-
-            auto callBackOrderlines = [&odls_keys] (const Str& key) -> void {
-                if(odls_keys.count(key)>0)
-                    odls_keys[key]++;
-                else
-                    odls_keys[key]=1;
-            };
-
-            for(unsigned i=0; i<nlogger; i++){
-                auto & log = (reinterpret_cast<logset_tbl<LOG_NTABLES>*>(logs))->log(i);
-                std::cout<<"Log "<<i<<":\n";
-                for (int tbl=0; tbl<LOG_NTABLES; tbl++){
-                    if(log.current_size(tbl)==0)
-                        continue;
-                    std::cout<<"Table "<< tbl<<std::endl;
-                    logmem_replay rep (log.get_buf(tbl), log.current_size(tbl));
-                    unsigned recs_replayed=0;
-                    if(tbl==3)
-                        recs_replayed = rep.template replay<decltype(callBackOrders)>(to_epoch, callBackOrders);
-                    else if (tbl==4)
-                        recs_replayed = rep.template replay<decltype(callBackOrderlines)>(to_epoch, callBackOrderlines);
-                    std::cout<<"Replayed "<< recs_replayed << " log records\n";
-                }
-            }
-
-            auto parseTab = [] (Str tabName, std::unordered_map<Str, unsigned> & tab) -> void {
-                std::cout<<"Table "<< tabName <<std::endl;
-                std::cout<<"Number of keys: "<< tab.size()<<std::endl;
-                uint64_t num_ops=0;
-                for (auto & elem : tab){
-                    //if(tabName == "Orderlines")
-                    //    std::cout<<"Times: "<< elem.second<<std::endl;
-                    num_ops+=elem.second;
-                }
-                std::cout<<"Average number of operations per key: "<< (float) num_ops/tab.size() <<std::endl;
-            };
-
-            parseTab("Orders", ods_keys);
-            parseTab("Orderlines", odls_keys);
-        }
+        #if REPLAY_LOG
+        kvepoch_t to_epoch = 0; // replay the entire log
+        replay_log(db_numa_node, to_epoch, db.num_warehouses());
         #endif
-
 
 
         //std::cout<<"Size of order_value: "<<sizeof(struct order_value)<<std::endl;
