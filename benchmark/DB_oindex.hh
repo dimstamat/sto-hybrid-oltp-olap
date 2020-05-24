@@ -775,8 +775,8 @@ public:
 
 
                 //};
-                //reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(logger)->record(cmd, qtimes, Str(e->key), Str(*valp), tbl_index_);
-                reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(logger)->record(cmd, qtimes, e->key.to_str(), valp->to_str(), tbl_index_);
+                reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(logger)->record(cmd, qtimes, Str(e->key), Str(*valp), tbl_index_);
+                //reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(logger)->record(cmd, qtimes, e->key.to_str(), valp->to_str(), tbl_index_);
                 //reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(logger)->record(cmd, qtimes, &e->key, sizeof(e->key), valp, sizeof(value_type), tbl_index_);
             }
             else if(LOG == 3)
