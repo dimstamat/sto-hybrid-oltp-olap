@@ -67,7 +67,6 @@ void logset::free(logset* ls) {
     delete[] (reinterpret_cast<char*>(ls) + ls->li_[-1].lsi_.allocation_offset_);
 }
 
-
 loginfo::loginfo(logset* ls, int logindex) {
     f_.lock_ = 0;
     f_.waiting_ = 0;
@@ -129,6 +128,7 @@ static void check_epoch() {
         global_log_epoch = global_log_epoch.next_nonzero(); // 0 isn't valid
     }
 }
+
 
 void* loginfo::run() {
     {
@@ -195,11 +195,14 @@ void loginfo::record(int command, const query_times& qtimes,
     // not needed for in-memory log
     size_t n = logrec_kvdelta::size(key.len, value.len)
         + logrec_epoch::size();
-    waitlist wait = { &wait };
+    //TODO: no need for locks since we use one log per thread!
+    //waitlist wait = { &wait };
     int stalls = 0;
     while (1) {
-        if (len_ - pos_ >= n
-            && (wait.next == &wait || f_.waiting_ == &wait)) {
+        //TODO: no need for locks since we use one log per thread!
+        if (len_ - pos_ >= n) {
+        //if (len_ - pos_ >= n
+        //    && (wait.next == &wait || f_.waiting_ == &wait)) {
             //kvepoch_t we = global_wake_epoch;
 
             // Potentially record a new epoch.
@@ -250,14 +253,16 @@ void loginfo::record(int command, const query_times& qtimes,
             #if MEASURE_LOG_RECORDS
             incr_cur_log_records();
             #endif
-            if (f_.waiting_ == &wait)
+            //TODO: no need for locks since we use one log per thread!
+            /*if (f_.waiting_ == &wait)
                 f_.waiting_ = wait.next;
-            release();
+            release();*/
             return;
         }
         //printf("wait.next == wait? %d, f_.waiting_ == wait? %d\n", (wait.next == &wait) ,  (f_.waiting_ == &wait) );
         // Otherwise must spin
-        if (wait.next == &wait) {
+        //TODO: no need for locks since we use one log per thread!
+        /*if (wait.next == &wait) {
             waitlist** p = &f_.waiting_;
             while (*p)
                 p = &(*p)->next;
@@ -273,6 +278,9 @@ void loginfo::record(int command, const query_times& qtimes,
         ++stalls;
         napms(50);
         acquire();
+        */
+        if (stalls == 0)
+            printf("stall\n");
     }
 }
 
@@ -654,6 +662,9 @@ logreplay::replayandclean1(kvepoch_t min_epoch, kvepoch_t max_epoch,
                            threadinfo *ti)
 {
     uint64_t nr = 0;
+    (void)min_epoch;
+    (void)max_epoch;
+    (void)ti;
     // Dimos - in order to use the log with STO/Silo
     #if 0
     const char *pos = buf_, *end = buf_ + size_;
@@ -801,6 +812,8 @@ logreplay::replay_copy(const char *tmpname, const char *first, const char *last)
 void
 logreplay::replay(int which, threadinfo *ti)
 {
+    (void)which;
+    (void)ti;
     // Dimos - to avoid compile errors when using the log with STO/Silo
     /*
     waituntilphase(REC_LOG_TS);

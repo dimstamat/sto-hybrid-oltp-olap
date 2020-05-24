@@ -592,17 +592,128 @@ struct logrec_kv {
         memcpy(lr->buf_ + key.len, val.s, val.len);
         return sizeof(*lr) + key.len + val.len;
     }
-    static size_t store(char *buf, uint32_t command,
+    static uint32_t store_digits(char* buf, uint64_t num){
+        uint32_t pos = 0;
+        uint32_t div=1;
+        while((num/div) > 9){
+            div *= 10;
+        }
+        while(div > 0){
+            char digit = (num / div) % 10;
+            buf[pos++] = digit;
+            div /= 10;
+        }
+        return pos;
+    }
+    static size_t store_str(char *buf, uint32_t command,
                         Str key, Str val,
                         kvtimestamp_t ts, uint32_t tbl){
         // XXX check alignment on some architectures
         logrec_kv *lr = reinterpret_cast<logrec_kv *>(buf);
         lr->command_ = command;
-        lr->size_ = sizeof(*lr) + key.len + val.len;
         lr->ts_ = ts;
         if(tbl==3){ // orders table
+            struct order_key {
+                uint64_t w_id;
+                uint64_t d_id;
+                uint64_t o_id;
+
+            };
+            struct order_value {
+                uint64_t o_c_id;
+                uint64_t o_carrier_id;
+                uint32_t o_entry_d;
+                uint32_t o_ol_cnt;
+                uint32_t o_all_local;
+            };
+            order_key * k = (order_key*) key.s;
+            uint32_t pos = 0;
+            // store each portion of the key separately, digit by digit
+            pos = store_digits(lr->buf_+pos, __bswap_64(k->w_id));
+            lr->buf_[pos++] = ',';
+            pos = store_digits(lr->buf_+pos, __bswap_64(k->d_id));
+            lr->buf_[pos++] = ',';
+            pos = store_digits(lr->buf_+pos, __bswap_64(k->o_id));
+            lr->keylen_ = pos;
+            lr->buf_[pos++] = '/';
+
+            order_value * v = (order_value*) val.s;
+            // store each portion of the value separately, digit by digit
+            pos = store_digits(lr->buf_+pos, v->o_c_id);
+            lr->buf_[pos++] = ',';
+            pos = store_digits(lr->buf_+pos, v->o_carrier_id);
+            lr->buf_[pos++] = ',';
+            pos = store_digits(lr->buf_+pos, v->o_entry_d);
+            lr->buf_[pos++] = ',';
+            pos = store_digits(lr->buf_+pos, v->o_ol_cnt);
+            lr->buf_[pos++] = ',';
+            pos = store_digits(lr->buf_+pos, v->o_all_local);
+            lr->buf_[pos++] = '/';
             
+            lr->size_ = sizeof(*lr) + pos;
+            return sizeof(*lr) + pos;
         }
+        else if (tbl==4){ // orderline table
+            class __attribute__((packed)) fix_string {
+            public:
+                fix_string() {
+                    memset(s_, ' ', 25);
+                }
+                explicit operator std::string() {
+                    return std::string(s_, 25);
+                }
+
+            private:
+                char s_[25];
+            };
+                
+            struct orderline_key {
+                uint64_t ol_w_id;
+                uint64_t ol_d_id;
+                uint64_t ol_o_id;
+                uint64_t ol_number;
+            };
+            struct orderline_value {
+                uint64_t       ol_i_id;
+                uint64_t       ol_supply_w_id;
+                uint32_t       ol_delivery_d;
+                uint32_t       ol_quantity;
+                int32_t        ol_amount;
+                fix_string ol_dist_info;
+            };
+            orderline_key * k = (orderline_key*) key.s;
+            uint32_t pos = 0;
+            // store each portion of the key separately, digit by digit
+            pos = store_digits(lr->buf_+pos, __bswap_64(k->ol_w_id));
+            lr->buf_[pos++] = ',';
+            pos = store_digits(lr->buf_+pos, __bswap_64(k->ol_d_id));
+            lr->buf_[pos++] = ',';
+            pos = store_digits(lr->buf_+pos, __bswap_64(k->ol_o_id));
+            lr->buf_[pos++] = ',';
+            pos = store_digits(lr->buf_+pos, __bswap_64(k->ol_number));
+            lr->keylen_ = pos;
+            lr->buf_[pos++] = '/';
+            
+            orderline_value * v = (orderline_value*) val.s;
+            // store each portion of the value separately, digit by digit
+            pos = store_digits(lr->buf_+pos, v->ol_i_id);
+            lr->buf_[pos++] = ',';
+            pos = store_digits(lr->buf_+pos, v->ol_supply_w_id);
+            lr->buf_[pos++] = ',';
+            pos = store_digits(lr->buf_+pos, v->ol_delivery_d);
+            lr->buf_[pos++] = ',';
+            pos = store_digits(lr->buf_+pos, v->ol_quantity);
+            lr->buf_[pos++] = ',';
+            pos = store_digits(lr->buf_+pos, v->ol_amount);
+            lr->buf_[pos++] = ',';
+            memcpy(lr->buf_+pos, std::string(v->ol_dist_info).c_str(), 25);
+            pos+=25;
+            lr->buf_[pos++] = '/';
+            
+            lr->size_ = sizeof(*lr) + pos;
+            return sizeof(*lr) + pos;
+        }
+        return 0;
     }
     static size_t store(char *buf, uint32_t command,
                         void* keyp, uint32_t keylen, void* valp, uint32_t vallen,
@@ -991,9 +1102,14 @@ void loginfo_tbl<N_TBLS>::record(int command, const loginfo::query_times& qtimes
                 pos_[tbl] += logrec_kvdelta::store(buf_ + pos_[tbl],
                                               logcmd_modify, key, value,
                                               qtimes.prev_ts, qtimes.ts);
-            else
-                pos_[tbl] += logrec_kv::store(buf_ + pos_[tbl],
+            else {
+                if(tbl == 3 || tbl == 4)
+                    pos_[tbl] += logrec_kv::store_str(buf_ + pos_[tbl],
+                                         command, key, value, qtimes.ts, tbl);
+                else 
+                    pos_[tbl] += logrec_kv::store(buf_ + pos_[tbl],
                                          command, key, value, qtimes.ts);
+            }
             assert(command != logcmd_none);
             #if MEASURE_LOG_RECORDS
             incr_cur_log_records();
