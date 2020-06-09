@@ -124,6 +124,17 @@ public:
         return fetch_and_add(&key_gen_, 1);
     }
 
+    // Dimos - support traverse for using UIndex for the log!
+    void traverse_all(std::function<void(const key_type& , value_type* )> callback){
+        for (auto& buck : map_){
+            internal_elem *curr = buck.head;
+            while (curr){ // traverse all elements within bucket
+                callback(curr->key, &curr->row_container.row);
+                curr = curr->next;
+            }
+        }
+    }
+
     sel_return_type
     select_row(const key_type& k, RowAccess access) {
         bucket_entry& buck = map_[find_bucket_idx(k)];
@@ -373,6 +384,19 @@ public:
             copy_row(e, &v);
         }
         buck.version.unlock_exclusive();
+    }
+
+    // Dimos - required when using for log!
+    void nontrans_put_no_lock(const key_type& k, const value_type& v){
+        bucket_entry& buck = map_[find_bucket_idx(k)];
+        internal_elem *e = find_in_bucket(buck, k);
+        if (e == nullptr) {
+            internal_elem *new_head = new internal_elem(k, v, true);
+            new_head->next = buck.head;
+            buck.head = new_head;
+        } else {
+            copy_row(e, &v);
+        }
     }
 
     // TObject interface methods
