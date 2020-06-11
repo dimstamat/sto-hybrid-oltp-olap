@@ -7,11 +7,16 @@
 #include <thread>
 
 #include <vector>
+#include <math.h>
 
 
 #include "../util/measure_latencies.hh"
 
-#define RUN_TPCH 0
+// 1 for TPCH on same node (MVCC)
+// 2 for TPCH on a replica on separate NUMA node (hybrid scheme)
+#define RUN_TPCH 1
+#define TPCH_SINGLE_NODE (RUN_TPCH == 1)
+#define TPCH_REPLICA (RUN_TPCH == 2)
 #define RUN_TPCC 1
 #define TEST_HASHTABLE 0
 
@@ -19,29 +24,46 @@
 static double latencies_hashtable_lookup[1][2];
 #endif
 
-#if RUN_TPCH
-#define LOGGING 0
+#if TPCH_SINGLE_NODE || TPCH_REPLICA
 constexpr unsigned tpch_thrs_size = 10; // the number of TPCH runner threads
+#endif
+
+#if TPCH_SINGLE_NODE || TPCH_REPLICA
+static uint64_t DB_size=0;
+#endif
+
+#if TPCH_SINGLE_NODE
+#define LOGGING 0
 
 #if MEASURE_LATENCIES
 static uint64_t latencies_sec_ord_scan[tpch_thrs_size][2];
 static uint64_t latencies_orderline_scan[tpch_thrs_size][2];
 #endif
-static uint64_t DB_size=0;
-#else
+
+#elif TPCH_REPLICA
 // Dimos - enable logging
 // 0: no logging
 // 1: default log - one log per thread
 // 2: one log per thread per table
-// 3: std::unordered_map for log
+// 3: map for log (std::unordered_map, or STO Uindex (hashtable))
 #define LOGGING 2
+// number of DB tables - partition the log
 #define LOG_NTABLES 9
+// how to store records in the log
+// 1 for default (storing the actual key/vals: memcpy(buf, struct, sizeof(struct)))
+// 2 for converting integers to strings with sprintf (calling key.to_str(), val.to_str())
+// 3 for converting integers to strings (digit by digit) and storing to log one by one: buf[pos++] = digit
+#define LOG_RECS 1
+#define LOGREC_OVERWRITE 1
+#else
+#define LOGGING 0
 #endif
 
-#define REPLAY_LOG 0
+#define REPLAY_LOG 1
+#define LOG_STATS 0 // display stats for the log by adding log records in a map <key, count>
 
 constexpr int nlogger = 10;
-
+// when to add to log
 // 1 for cleanup, 2 for install
 #define ADD_TO_LOG (LOGGING>0? 2 : 0)
 
@@ -76,6 +98,8 @@ using namespace std;
 #include "TPCH_runner.hh"
 
 extern kvepoch_t global_log_epoch;
+
+using tpch::tpch_db;
 
 
 // #include "TPCH_queries.hh" at the bottom of the file so that to see the types of the structs used!!
@@ -116,8 +140,13 @@ extern int tpcc_tcn(int, char const* const*);
 // required for NUMA-aware placement
 extern TopologyInfo topo_info;
 
-
 namespace tpcc {
+
+enum class db_type : int {
+    simple = 1, // used by tpcc only
+    hybrid = 2  // used by tpcc and tpch
+};
+
 
 using namespace db_params;
 using bench::db_profiler;
@@ -213,47 +242,7 @@ class tpcc_access;
 #define TPCC_HASH_INDEX 1
 #endif
 
-#if REPLAY_LOG
-class tpch_db {
-    public:
-    template <typename K, typename V>
-    using OIndex = ordered_index<K, V, db_params::db_default_params>;
-
-    typedef OIndex<order_key, order_value>               od_table_type;
-    typedef OIndex<orderline_key, orderline_value>       ol_table_type;
-
-    std::vector<od_table_type> tbl_ods_;
-    std::vector<ol_table_type> tbl_ols_;
-    
-    od_table_type& tbl_orders(uint64_t w_id){
-        return tbl_ods_[w_id - 1];
-    }
-    ol_table_type& tbl_orderlines(uint64_t w_id){
-        return tbl_ols_[w_id - 1];
-    }
-
-    void thread_init_all(){
-        for(auto& t : tbl_ods_){
-            t.thread_init();
-        }
-        for(auto& t : tbl_ols_){
-            t.thread_init();
-        }
-    }
-
-    tpch_db(int num_whs): num_whs_(num_whs) {
-        // initialize the OLAP DB
-        for(int i=0; i<num_whs; i++){
-            tbl_ods_.emplace_back(999983/*num_customers * 10 * 2*/);
-            tbl_ols_.emplace_back(999983/*num_customers * 100 * 2*/);
-        }
-    }
-    inline ~tpch_db(){}
-    private:
-        uint64_t num_whs_;
-};
-
-#endif
+//TODO: make a tpcc_db_single which will contain secondary indexes required for TPC-H!
 
 template <typename DBParams>
 class tpcc_db {
@@ -303,13 +292,13 @@ public:
     typedef UIndex<warehouse_key, warehouse_value>       wh_table_type;
     typedef UIndex<district_key, district_value>         dt_table_type;
     typedef UIndex<customer_key, customer_value>         cu_table_type;
-    typedef OIndexLog<order_key, order_value>               od_table_type;
-#if RUN_TPCH
+    typedef OIndexLog<order_key, order_value>            od_table_type; // if LOGGING is false, then the OIndex won't perform any logging!
+#if TPCH_SINGLE_NODE
     // secondary index for <o_entry_d, order_value*>
     typedef OIndex<order_sec_key, order_sec_value>       od_sec_entry_d_type;
-    //typedef OIndex<orderline_sec_key, orderline_sec_value> ol_sec_deliv_d_type;
+    typedef OIndex<orderline_sec_key, orderline_sec_value> ol_sec_deliv_d_type;
 #endif
-    typedef OIndexLog<orderline_key, orderline_value>       ol_table_type;
+    typedef OIndexLog<orderline_key, orderline_value>    ol_table_type;
     #if TEST_HASHTABLE
     typedef UIndex<orderline_key, orderline_value_deliv_d> ol_hashtable_type;
     #endif
@@ -322,11 +311,12 @@ public:
     typedef OIndex<history_key, history_value>           ht_table_type;
 
     explicit inline tpcc_db(int num_whs);
+    explicit inline tpcc_db(int num_whs, db_type type);
     explicit inline tpcc_db(const std::string& db_file_name) = delete;
     inline ~tpcc_db();
     // runner_num: the number of the runner thread: [0-num_runners)
     void thread_init_all(int runner_num);
-    #if RUN_TPCH
+    #if TPCH_SINGLE_NODE
     void thread_init_tpch();
     #endif
 
@@ -383,13 +373,13 @@ public:
     od_table_type& tbl_orders(uint64_t w_id) {
         return tbl_ods_[w_id - 1];
     }
-    #if RUN_TPCH
+    #if TPCH_SINGLE_NODE
     od_sec_entry_d_type& tbl_sec_orders(){
         return tbl_sec_ods_;
     }
-    //ol_sec_deliv_d_type& tbl_sec_orderlines(){
-    //    return tbl_sec_ols_;
-    //}
+    ol_sec_deliv_d_type& tbl_sec_orderlines(){
+        return tbl_sec_ols_;
+    }
     #endif
     ol_table_type& tbl_orderlines(uint64_t w_id) {
         return tbl_ols_[w_id - 1];
@@ -425,9 +415,18 @@ public:
         return dlvy_queue_;
     }
 
-private:
+    db_type& get_type(){
+        return type_;
+    }
+
+    void set_type(db_type t){
+        type_ = t;
+    }
+
+protected:
     size_t num_whs_;
     it_table_type *tbl_its_;
+    db_type type_;
 
 #if TPCC_SPLIT_TABLE
     wc_table_type tbl_whs_const_;
@@ -447,9 +446,9 @@ private:
     std::vector<dt_table_type> tbl_dts_;
     std::vector<cu_table_type> tbl_cus_;
     std::vector<od_table_type> tbl_ods_;
-    #if RUN_TPCH
+    #if TPCH_SINGLE_NODE
     od_sec_entry_d_type tbl_sec_ods_;
-    //ol_sec_deliv_d_type tbl_sec_ols_;
+    ol_sec_deliv_d_type tbl_sec_ols_;
     #endif
     std::vector<ol_table_type> tbl_ols_;
     #if TEST_HASHTABLE
@@ -468,6 +467,51 @@ private:
 
     friend class tpcc_access<DBParams>;
 };
+
+
+// That's the DB used both by TPC-C and TPC-H when using TPCH_SINGLE approach (same NUMA node).
+template <typename DBParams>
+class hybrid_db : public tpcc_db<DBParams> {
+    template <typename K, typename V>
+    using OIndex = typename std::conditional<DBParams::MVCC,
+          mvcc_ordered_index<K, V, DBParams>,
+          ordered_index<K, V, DBParams>>::type;
+          
+    // secondary index for <o_entry_d, order_value*>
+    typedef OIndex<order_sec_key, order_sec_value>       od_sec_entry_d_type;
+    typedef OIndex<orderline_sec_key, orderline_sec_value> ol_sec_deliv_d_type;
+
+    od_sec_entry_d_type tbl_sec_ods_;
+    ol_sec_deliv_d_type tbl_sec_ols_;
+
+    public:
+    od_sec_entry_d_type& tbl_sec_orders(){
+        return tbl_sec_ods_;
+    }
+    ol_sec_deliv_d_type& tbl_sec_orderlines(){
+        return tbl_sec_ols_;
+    }
+
+    hybrid_db(int num_whs);
+
+    void thread_init_all_plus_sec(int runner_num);
+};
+
+template <typename DBParams>
+hybrid_db<DBParams>::hybrid_db(int num_whs)
+    : tpcc_db<DBParams>(num_whs),
+    tbl_sec_ods_(num_whs * 999983/*num_customers * 10 * 2*/),
+    tbl_sec_ols_(num_whs * 999983/*num_customers * 100 * 2*/)
+    {
+        tpcc_db<DBParams>::set_type(db_type::hybrid);
+    }
+
+template <typename DBParams>
+void hybrid_db<DBParams>::thread_init_all_plus_sec(int runner_num) {
+    tpcc_db<DBParams>::thread_init_all(runner_num);
+    tbl_sec_ods_.thread_init();
+    tbl_sec_ols_.thread_init();
+}
 
 template <typename DBParams>
 class tpcc_runner {
@@ -570,21 +614,22 @@ private:
 template <typename DBParams>
 pthread_barrier_t tpcc_prepopulator<DBParams>::sync_barrier;
 
-
 template <typename DBParams>
 tpcc_db<DBParams>::tpcc_db(int num_whs)
     : num_whs_(num_whs),
+    type_(db_type::simple),
 #if TPCC_SPLIT_TABLE
       tbl_whs_const_(256),
       tbl_whs_comm_(256),
 #else
       tbl_whs_(256),
 #endif
-#if RUN_TPCH
+#if TPCH_SINGLE_NODE
     tbl_sec_ods_(num_whs * 999983/*num_customers * 10 * 2*/),
-    //tbl_sec_ols_(num_whs * 999983/*num_customers * 100 * 2*/),
+    tbl_sec_ols_(num_whs * 999983/*num_customers * 100 * 2*/),
 #endif
-      oid_gen_() {
+      oid_gen_()
+       {
     //constexpr size_t num_districts = NUM_DISTRICTS_PER_WAREHOUSE;
     //constexpr size_t num_customers = NUM_CUSTOMERS_PER_DISTRICT * NUM_DISTRICTS_PER_WAREHOUSE;
 
@@ -657,9 +702,9 @@ void tpcc_db<DBParams>::thread_init_all(int runner_num) {
         t.thread_init();
     for (auto& t : tbl_ods_)
         t.thread_init(runner_num); // enable logging (as a template parameter earlier) and set runner_num
-    #if RUN_TPCH
+    #if TPCH_SINGLE_NODE
     tbl_sec_ods_.thread_init();
-    //tbl_sec_ols_.thread_init();
+    tbl_sec_ols_.thread_init();
     #endif
     for (auto& t : tbl_ols_)
         t.thread_init(runner_num); // enable logging (as a template parameter earlier) and set runner_num
@@ -676,13 +721,13 @@ void tpcc_db<DBParams>::thread_init_all(int runner_num) {
         t.thread_init();
 }
 
-#if RUN_TPCH
+#if TPCH_SINGLE_NODE
 template <typename DBParams>
 void tpcc_db<DBParams>::thread_init_tpch(){ // call thread init only for the tables required for TPCH
     for (auto& t : tbl_ods_)
-        t.thread_init(); // why do we need logging for TPC-H??
+        t.thread_init(); // why do we need logging for TPC-H?? We don't :)
     tbl_sec_ods_.thread_init();
-    //tbl_sec_ols_.thread_init();
+    tbl_sec_ols_.thread_init();
     for (auto& t : tbl_ols_)
         t.thread_init();
 }
@@ -954,7 +999,21 @@ void tpcc_prepopulator<DBParams>::expand_customers(uint64_t wid) {
 
             order_cidx_key ock(wid, did, ov.o_c_id, oid);
 
-        #if RUN_TPCH
+        if(db.get_type() == db_type::hybrid){
+            order_sec_value val;
+            hybrid_db<DBParams> &db_h = reinterpret_cast<hybrid_db<DBParams>&>(db);
+            auto val_p = db_h.tbl_orders(wid).nontrans_put_el(ok, ov);
+            // store the internal_elem
+            val.o_c_entry_d_p = val_p;
+            // put into the secondary index as well
+            db_h.tbl_sec_orders().nontrans_put(order_sec_key(entry_date, wid, did, oid), val);
+        }
+        else if (db.get_type() == db_type::simple){
+            db.tbl_orders(wid).nontrans_put(ok, ov);
+        }
+
+
+        /*#if TPCH_SINGLE_NODE
             order_sec_value val;
             auto val_p = db.tbl_orders(wid).nontrans_put(ok, ov);
             // store the internal_elem
@@ -963,7 +1022,7 @@ void tpcc_prepopulator<DBParams>::expand_customers(uint64_t wid) {
             db.tbl_sec_orders().nontrans_put(order_sec_key(entry_date, wid, did, oid), val);
         #else
             db.tbl_orders(wid).nontrans_put(ok, ov);
-        #endif
+        #endif*/
 #endif
             db.tbl_order_customer_index(wid).nontrans_put(ock, {});
 
@@ -1110,9 +1169,12 @@ class tpcc_access {
 // class tpcc_access will also contain the tpch_runner_thread because the tpch runner threads have access to the same tpcc DB.
 
 public:
-    static void prepopulation_worker(tpcc_db<DBParams> &db, int worker_id, int warehouse_id, int filler_id) {
+    static void prepopulation_worker(tpcc_db<DBParams> &db, int worker_id, int worker_num, int warehouse_id, int filler_id) {
         tpcc_prepopulator<DBParams> pop(worker_id, warehouse_id, filler_id, db);
-        db.thread_init_all(worker_id);
+        // Dimos - set affinity on the CPU of the specified NUMA node, in order for the DB to live in that node!
+        set_affinity(worker_id);
+        // must be worker_num to initialize the corresponding log!
+        db.thread_init_all(worker_num);
         pop.run();
     }
 
@@ -1124,12 +1186,12 @@ public:
         std::vector<std::thread> prepop_thrs;
         if(db_numa_node == -1){ // normal operation (NUMA unaware): use worker id == warehouse id and filler id == 1
             for (int i = 1; i <= db.num_warehouses(); ++i)
-                prepop_thrs.emplace_back(prepopulation_worker, std::ref(db), i-1, i, 0);
+                prepop_thrs.emplace_back(prepopulation_worker, std::ref(db), i-1, /*worker_num*/ (i-1), i, 0);
         }
         else { // NUMA aware: Create DB only in specified NUMA node: worker id != warehouse id
             auto & cpus = topo_info.cpu_id_list[db_numa_node];
             for (int i = 1; i <= db.num_warehouses(); ++i){
-                prepop_thrs.emplace_back(prepopulation_worker, std::ref(db), cpus[(i-1) % cpus.size()], i, cpus[0]); // filler will be the first cpu of the specified NUMA node (db_numa_node)
+                prepop_thrs.emplace_back(prepopulation_worker, std::ref(db), cpus[(i-1) % cpus.size()], /*worker_num*/ (i-1),  i, cpus[0]); // filler will be the first cpu of the specified NUMA node (db_numa_node)
             }
             
         }
@@ -1142,13 +1204,23 @@ public:
 
     /**  TPCH  **
      **        **/
-    #if RUN_TPCH
-    static void tpch_runner_thread(tpcc_db<DBParams>& db, db_profiler& prof, int runner_id, double time_limit, int mix, uint64_t& q_cnt){
-        tpcc::tpcc_input_generator ig(runner_id, db.num_warehouses());
-        tpch::tpch_runner<DBParams> runner(runner_id, ig, db, mix);
+    #if TPCH_SINGLE_NODE
+    static void tpch_runner_thread(void* db, tpch::db_type type, db_profiler& prof, int runner_id, double time_limit, uint64_t& q_cnt){
+        int num_whs =0;
+        if(type == tpch::db_type::single)
+            num_whs = ((tpcc::tpcc_db<DBParams>*) db)->num_warehouses();
+        else if(type == tpch::db_type::hybrid)
+            num_whs = ((tpch::tpch_db*) db)->num_warehouses();
+        tpcc::tpcc_input_generator ig(runner_id, num_whs);
+        tpch::tpch_runner<DBParams> runner(runner_id, ig, db, type);
         ::TThread::set_id(runner_id);
         set_affinity(runner_id);
-        db.thread_init_tpch();
+        
+        if(type == tpch::db_type::single)
+            ((tpcc::tpcc_db<DBParams>*) db)->thread_init_tpch();
+        else if(type == tpch::db_type::hybrid)
+            ((tpch::tpch_db*) db)->thread_init_all();
+        
         
         uint64_t tsc_diff = (uint64_t)(time_limit * constants::processor_tsc_frequency * constants::billion);
         auto start_t = prof.start_timestamp();
@@ -1183,7 +1255,9 @@ public:
         uint64_t tsc_diff = (uint64_t)(time_limit * constants::processor_tsc_frequency * constants::billion);
         auto start_t = prof.start_timestamp();
 
-        uint64_t div = 10;
+        #if LOGGING > 0
+            uint64_t div = 10;
+        #endif
 
         while (true) {
             // Executed enqueued delivery transactions, if any
@@ -1218,12 +1292,14 @@ public:
             }
 
             if (LOGGING > 0){
-                if ( runner_id == 0 && div>0 && (curr_t - start_t) >= tsc_diff/div){
+                // advance log epoch periodically
+                /*if ( runner_id == 0 && div>0 && (curr_t - start_t) >= tsc_diff/div){
                     // slow if we do e.next_nonzero() and then e.value()! Either do e.next_nonzero() and don't get the value, or do e++ and e.value().
-                    global_log_epoch = global_log_epoch.next_nonzero();
+                    //global_log_epoch = global_log_epoch.next_nonzero();
+                    global_log_epoch++;
                     //std::cout<<"Changed epoch to "<< global_log_epoch.value()<<std::endl;
                     div--;
-                }
+                }*/
             }
 
             txn_type t = runner.next_transaction();
@@ -1280,9 +1356,10 @@ public:
         (void)verbose;
     #endif
 
-    #if RUN_TPCH
+    #if TPCH_SINGLE_NODE || TPCH_REPLICA
         std::vector<std::thread> tpch_runner_thrs;
         std::vector<uint64_t> q_cnts(size_t(run_tpch_cpus.size()), 0);
+        (void)prof_tpch;
     #else
         (void)run_tpch_cpus;
         (void)prof_tpch;
@@ -1342,8 +1419,8 @@ public:
         bzero(latencies_hashtable_lookup, 2 * sizeof(uint64_t));
     #endif
         
-
-    #if RUN_TPCH
+    /*
+    #if TPCH_SINGLE_NODE
         #if MEASURE_LATENCIES
         bzero(latencies_sec_ord_scan, tpch_thrs_size * 2 * sizeof(uint64_t));
         bzero(latencies_orderline_scan, tpch_thrs_size * 2 * sizeof(uint64_t));
@@ -1351,9 +1428,16 @@ public:
         // start tpch threads
         int num_tpch_runners = run_tpch_cpus.size();
         for (int i = 0; i < num_tpch_runners; ++i) {
-            tpch_runner_thrs.emplace_back(tpch_runner_thread, std::ref(db), std::ref(prof_tpch), (numa_aware? run_tpch_cpus[i] : i), time_limit, mix, std::ref(q_cnts[i]));
+            tpch_runner_thrs.emplace_back(tpch_runner_thread, &db, std::ref(prof_tpch), (numa_aware? run_tpch_cpus[i] : i), time_limit, std::ref(q_cnts[i]));
+        }
+    #elif TPCH_REPLICA
+        // start tpch threads
+        int num_tpch_runners = run_tpch_cpus.size();
+        for (int i = 0; i < num_tpch_runners; ++i) {
+            tpch_runner_thrs.emplace_back(tpch_runner_thread, &db, std::ref(prof_tpch), (numa_aware? run_tpch_cpus[i] : i), time_limit, std::ref(q_cnts[i]));
         }
     #endif
+    */
 
 
     uint64_t total_txn_cnt = 0;
@@ -1363,11 +1447,12 @@ public:
         for (auto& cnt : txn_cnts)
             total_txn_cnt += cnt;
     #endif
-    #if RUN_TPCH
+    #if TPCH_SINGLE_NODE
         #if RUN_TPCC
             // measure the TPC-C throughput separately from the TPC-H
             prof.finish(total_txn_cnt);
         #endif
+        /*
         // join tpch threads
         for (auto &t: tpch_runner_thrs)
             t.join();
@@ -1390,7 +1475,7 @@ public:
         for (auto& cnt : q_cnts){
             q_total_count+= cnt;
         }
-        prof_tpch.finish(q_total_count);
+        prof_tpch.finish(q_total_count);*/
         return total_txn_cnt;
     #else 
         #if RUN_TPCC
@@ -1400,13 +1485,14 @@ public:
     #endif
     }
 
-    static int parse_numa_nodes(char* opt, int num_threads, vector<int> & run_cpus, vector<int> & run_tpch_cpus, bool sibling){
+    static int parse_numa_nodes(char* opt, int num_threads, vector<int> & run_cpus, vector<int> & run_tpch_cpus, int db_numa_node, bool sibling){
+        (void)db_numa_node;
         int numa_nodes_cnt=0;
         char* numa_node_str;
         int cpus_per_node =0;
         unsigned i=0;
         int cpus_total=0;
-        #if RUN_TPCH
+        #if TPCH_SINGLE_NODE || TPCH_REPLICA
         int tpch_cpus_total=0;
         #endif
         bool done=false;
@@ -1442,7 +1528,7 @@ public:
             std::cout<<"Pinning threads on sibling cores\n";
         std::cout<<"Running workers in NUMA nodes ";
         for (auto node : run_numa_nodes){
-        #if RUN_TPCH
+        #if TPCH_SINGLE_NODE
             if(topo_info.cpu_id_list[node].size() - num_threads < tpch_thrs_size ){
                 std::cout<<"Error: Cannot run "<< tpch_thrs_size <<" TPCH runner threads on remaining " << (topo_info.cpu_id_list[0].size() - num_threads ) <<" cores\n";
                 return -1;
@@ -1456,7 +1542,15 @@ public:
             for(auto cpu : topo_info.cpu_id_list[node]){
                 // if done, assign the remaining cores for TPCH
                 if(done){
-                    #if RUN_TPCH
+                    #if TPCH_SINGLE_NODE
+                    // see the difference when starting tpch threads in different NUMA node
+                    /*int i=0;
+                    for(auto cpu : topo_info.cpu_id_list[1]){
+                        run_tpch_cpus.push_back(cpu);
+                        if(++i == tpch_thrs_size)
+                            break;
+                    }
+                    break;*/
                     if(!sibling){
                         if(tpch_cpus_total++ == tpch_thrs_size)
                             break;
@@ -1471,6 +1565,14 @@ public:
                         run_tpch_cpus.push_back( (cpu + CPUs_num/2) % CPUs_num ); // add its sibling thread
                     }
                     continue;
+                    #elif TPCH_REPLICA
+                    assert(db_numa_node>=0); // we must specify the NUMA node to store the DB, so that to know where to start the OLAP replica!
+                    for(auto cpu : topo_info.cpu_id_list[(db_numa_node + 1) % topo_info.num_nodes ]){
+                        if(tpch_cpus_total++ == tpch_thrs_size)
+                            break;
+                        run_tpch_cpus.push_back(cpu);
+                    }
+                    break;
                     #else
                     break;
                     #endif
@@ -1509,64 +1611,86 @@ public:
     }
 
     #if REPLAY_LOG
-    static void logdrainer_thread(tpch_db& db, unsigned logdrainer_id, unsigned thread_id, kvepoch_t to_epoch){
+    static void logdrainer_thread(tpch_db& db, unsigned logdrainer_id, unsigned thread_id, kvepoch_t to_epoch, unsigned* logrecs_replayed){
+        unsigned recs_replayed=0;
         std::cout<<"Logdrain thread "<< logdrainer_id <<", CPU: "<< thread_id<<std::endl;
         set_affinity(thread_id);
         db.thread_init_all();
+        auto callBack = [&db] (const Str& key, const Str& val, kvtimestamp_t ts, uint32_t cmd, int tbl) -> bool {
+            if(cmd == logcmd_put || cmd == logcmd_replace){
+                if(tbl==3) { // table orders
+                    #if LOG_RECS == 1
+                    order_key k(key);
+                    order_value v(val);
+                    #elif LOG_RECS > 1
+                    // strtok messes up key.s and also we don't want to make a copy of key.s! Tokenize the key/val manually in the constructor!
+                    order_key k(key.s);
+                    order_value v(val.s);
+                    #else
+                    order_key k(key);
+                    order_value v(val);
+                    #endif
+                    uint64_t wid = bswap(k.o_w_id);
+                    db.tbl_orders(wid).nontrans_put_if_ts(k, v, ts);
+                }
+                else if(tbl==4) { // table orderlines
+                    #if LOG_RECS == 1
+                    orderline_key k(key);
+                    orderline_value v(val);
+                    #elif LOG_RECS > 1
+                    orderline_key k(key.s);
+                    orderline_value v(val.s);
+                    #else
+                    orderline_key k(key);
+                    orderline_value v(val);
+                    #endif
+                    uint64_t wid = bswap(k.ol_w_id);
+                    db.tbl_orderlines(wid).nontrans_put_if_ts(k, v, ts);
+                }
+            }
+            else if(cmd == logcmd_remove){
+                always_assert(false, "log command delete not supported yet!\n");
+            }
+            assert(cmd != logcmd_none);
+            
+            return true;
+        };
         #if LOGGING == 1
             auto & log = (reinterpret_cast<logset*>(logs))->log(logdrainer_id);
             logmem_replay rep(log.get_buf(), log.current_size());
-            auto callBack = [&] (const Str& key) -> void {
-                (void)key;
-            };
-            unsigned recs_replayed = rep.template replay<decltype(callBack)>(to_epoch, callBack);
+            recs_replayed = rep.template replay<decltype(callBack)>(to_epoch, callBack, -1);
             std::cout<<"Replayed "<< recs_replayed << " log records\n";
         #elif LOGGING == 2
             auto & log = (reinterpret_cast<logset_tbl<LOG_NTABLES>*>(logs))->log(logdrainer_id);
-            std::cout<<"Log "<<logdrainer_id<<":\n";
             for (int tbl=0; tbl<LOG_NTABLES; tbl++){
                 if(log.current_size(tbl)==0)
                     continue;
-                std::cout<<"Table "<< tbl<<std::endl;
                 logmem_replay rep (log.get_buf(tbl), log.current_size(tbl));
-                unsigned recs_replayed=0;
-                auto callBack = [&db, tbl] (const Str& key, uint32_t cmd) -> void {
-                    (void)key;
-                    (void)cmd;
-                    if(cmd == logcmd_put || cmd == logcmd_modify){
-                        if(tbl==3) { // table orders
-                            //order_key k;
-                            //db.tbl_orders()
-                        }
-                        else if(tbl==4) { // table orderlines
-
-                        }
-
-                    }
-                    else if(cmd == logcmd_remove){
-
-                    }
-                    assert(cmd != logcmd_none);
-                };
-                recs_replayed = rep.template replay<decltype(callBack)>(to_epoch, callBack);
-                std::cout<<"Replayed "<< recs_replayed << " log records\n";
+                recs_replayed += rep.template replay<decltype(callBack)>(to_epoch, callBack, tbl);
+            }
+            //std::cout<<"Replayed "<< recs_replayed << " log records\n";
+        #elif LOGGING == 3
+            auto & log = (reinterpret_cast<logset_map<LOG_NTABLES>*>(logs))->log(logdrainer_id);
+            for (int tbl=0; tbl<LOG_NTABLES; tbl++){
+                if(tbl != 3 && tbl != 4) // we cannot determine the size of the map with unordered_index, since it resizes it from initialization and shows a constant size(). Consider adding a field that measures the number of elements currently in the map
+                    continue;
+                logmap_replay rep(log.get_map(tbl));
+                recs_replayed += rep.template replay<decltype(callBack)>(to_epoch, callBack, tbl);
             }
         #endif
+        logrecs_replayed[logdrainer_id] = recs_replayed;
     }
 
-    static void replay_log(int db_numa_node, kvepoch_t to_epoch, int num_warehouses){
+    static unsigned replay_log(tpch_db & db, int db_numa_node, kvepoch_t to_epoch){
         std::vector<std::thread> logdrainer_thrs;
-        // start the logdrainer threads in the next NUMA node
+        // start the logdrainer threads in the NUMA node after the TPC-C run NUMA node
         unsigned logdrainer_numa = (db_numa_node+1) % topo_info.num_nodes;
         std::cout<<"Starting log drainer threads in NUMA node "<< logdrainer_numa<<std::endl;
         auto & cpus = topo_info.cpu_id_list[logdrainer_numa];
-
-        // set the affinity of this thread to a CPU on the OLAP numa node
-        set_affinity(cpus[0]);
-        tpch_db db(num_warehouses);
+        unsigned * logrecs_replayed = new unsigned [cpus.size()];
         unsigned i=0;
         for(auto& cpu : cpus){
-            logdrainer_thrs.emplace_back(logdrainer_thread, std::ref(db), i++, cpu, to_epoch);
+            logdrainer_thrs.emplace_back(logdrainer_thread, std::ref(db), i++, cpu, to_epoch, logrecs_replayed);
             if (i == nlogger)
                 break;
         }
@@ -1574,7 +1698,14 @@ public:
         for (auto& thr : logdrainer_thrs)
             thr.join();
 
-        #if 0
+        unsigned log_recs_total=0;
+        for(unsigned i=0; i<logdrainer_thrs.size(); i++){
+            log_recs_total+= logrecs_replayed[i];
+        }
+
+        return log_recs_total;
+
+        #if LOG_STATS
             std::unordered_map<Str, unsigned> ods_keys;
             std::unordered_map<Str, unsigned> odls_keys;
 
@@ -1602,9 +1733,9 @@ public:
                     logmem_replay rep (log.get_buf(tbl), log.current_size(tbl));
                     unsigned recs_replayed=0;
                     if(tbl==3)
-                        recs_replayed = rep.template replay<decltype(callBackOrders)>(to_epoch, callBackOrders);
+                        recs_replayed = rep.template replay<decltype(callBackOrders)>(to_epoch, callBackOrders, tbl);
                     else if (tbl==4)
-                        recs_replayed = rep.template replay<decltype(callBackOrderlines)>(to_epoch, callBackOrderlines);
+                        recs_replayed = rep.template replay<decltype(callBackOrderlines)>(to_epoch, callBackOrderlines, tbl);
                     std::cout<<"Replayed "<< recs_replayed << " log records\n";
                 }
             }
@@ -1626,6 +1757,72 @@ public:
         #endif
     }
     #endif
+
+    static void verify_db_worker(tpcc_db<DBParams> & db, tpch_db& olap_db, int w_id){
+        // verify orders table
+        {
+            int num_orders_tpcc=0, num_orders_tpch=0;
+            auto orders_callback_tpcc = [&num_orders_tpcc, &olap_db, &w_id] (const tpcc::order_key&k, const tpcc::order_value&v) -> bool{
+                num_orders_tpcc++;
+                tpcc::order_value * v_olap = olap_db.tbl_orders(w_id).nontrans_get(k);
+                assert(v_olap);
+                //assert(Str(v) == Str(*v_olap)); // WARNING: the size of order_value is actually 28 bytes but sizeof(order_value) is 32! This means the memcmp will compare more bytes at the end and it might say the values are not equal!! (Str operator == uses memcmp)
+                assert(v == *v_olap);
+                return true;
+            };
+            auto orders_callback_tpch = [&num_orders_tpch] (const tpcc::order_key&k, const tpcc::order_value&v) -> bool{
+                (void)k;
+                (void)v;
+                num_orders_tpch++;
+                return true;
+            };
+            order_key k0(0, 0, 0);
+            order_key k1(10, NUM_DISTRICTS_PER_WAREHOUSE, std::numeric_limits<uint64_t>::max());
+            bool success = db.tbl_orders(w_id)
+                                    .template range_scan<decltype(orders_callback_tpcc), false> (true /*read-only access - no TItems*/, k0, k1, orders_callback_tpcc, tpcc::RowAccess::None, false /*No Phantom protection*/);
+            assert(success);
+            //std::cout<<"TPCC Warehouse "<< w_id <<" orders elems: " << num_orders_tpcc<<std::endl;
+            success = olap_db.tbl_orders(w_id)
+                                    .template range_scan<decltype(orders_callback_tpch), false> (true /*read-only access - no TItems*/, k0, k1, orders_callback_tpch, tpcc::RowAccess::None, false /*No Phantom protection*/);
+            assert(success);
+            //std::cout<<"TPCH Warehouse "<< w_id <<" orders elems: " << num_orders_tpch<<std::endl;
+            assert(num_orders_tpcc == num_orders_tpch);
+        }
+        // verify orderlines table
+        {
+            int num_orderlines_tpcc=0, num_orderlines_tpch=0;
+            auto orderlines_callback_tpcc = [&num_orderlines_tpcc, &olap_db, &w_id] (const orderline_key&k, const orderline_value&v) -> bool{
+                num_orderlines_tpcc++;
+                const orderline_value * v_olap = olap_db.tbl_orderlines(w_id).nontrans_get(k);
+                assert(v_olap);
+                assert(v == *v_olap);
+                return true;
+            };
+            auto orderlines_callback_tpch = [&num_orderlines_tpch] (const orderline_key&k, const orderline_value&v) -> bool{
+                (void)k;
+                (void)v;
+                num_orderlines_tpch++;
+                return true;
+            };
+            orderline_key ol_k0(0, 0, 0, 0);
+            orderline_key ol_k1(10, NUM_DISTRICTS_PER_WAREHOUSE, std::numeric_limits<uint64_t>::max(), 15);
+            bool success = db.tbl_orderlines(w_id)
+                                    .template range_scan<decltype(orderlines_callback_tpcc), false> (true /*read-only access - no TItems*/, ol_k0, ol_k1, orderlines_callback_tpcc, tpcc::RowAccess::None, false /*No Phantom protection*/);
+            assert(success);
+            success = olap_db.tbl_orderlines(w_id)
+                                    .template range_scan<decltype(orderlines_callback_tpch), false> (true /*read-only access - no TItems*/, ol_k0, ol_k1, orderlines_callback_tpch, tpcc::RowAccess::None, false /*No Phantom protection*/);
+            assert(success);
+            assert(num_orderlines_tpcc == num_orderlines_tpch);
+        }
+    }
+    
+    static void verify_db(tpcc_db<DBParams> & db, tpch_db& olap_db){
+        std::vector<std::thread> verify_thrs;
+        for (int i = 1; i <= db.num_warehouses(); ++i)
+            verify_thrs.emplace_back(verify_db_worker, std::ref(db), std::ref(olap_db), i);
+        for (auto &t : verify_thrs)
+            t.join();
+    }
 
     static int execute(int argc, const char *const *argv) {
         std::cout << "*** DBParams::Id = " << DBParams::Id << std::endl;
@@ -1673,7 +1870,7 @@ public:
                     std::cout<<"Storing DB (warehouses) in NUMA node "<< db_numa_node<<std::endl;
                     break;
                 case opt_run_numa:
-                    if((ret = parse_numa_nodes((char*)clp->val.s, num_threads, run_cpus, run_tpch_cpus, sibling)) != 0){
+                    if((ret = parse_numa_nodes((char*)clp->val.s, num_threads, run_cpus, run_tpch_cpus, db_numa_node, sibling)) != 0){
                         clp_stop = true;
                         break;
                     }
@@ -1722,7 +1919,7 @@ public:
             return ret;
 
         // Set thread affinity for main thread 
-        if(db_numa_node>0){ // NUMA-aware
+        if(db_numa_node>=0){ // NUMA-aware
             // get CPUs of the specified NUMA node
             auto & cpus = topo_info.cpu_id_list[db_numa_node];
             set_affinity(cpus[0]); // start filler thread from the first CPU of the desired NUMA node
@@ -1746,7 +1943,7 @@ public:
                       << (counter_mode ? "counter" : "record") << " mode" << std::endl;
         }
 
-        #if RUN_TPCH
+        #if TPCH_SINGLE_NODE
         /*if (DBParams::Id != db_params_id::MVCC){
             std::cout<<"Error: Should use MVCC when running TPC-H\n";
             return -1;
@@ -1754,30 +1951,11 @@ public:
         #endif
 
         db_profiler prof(spawn_perf);
+        #if TPCH_SINGLE_NODE
+        hybrid_db<DBParams> db(num_warehouses);
+        #else
         tpcc_db<DBParams> db(num_warehouses);
-
-        std::cout << "Prepopulating database..." << std::endl;
-        prepopulate_db(db, db_numa_node);
-        std::cout << "Prepopulation complete." << std::endl;
-
-        #if RUN_TPCH
-        db_profiler prof_tpch(spawn_perf, DB_size);
         #endif
-
-        #if RUN_TPCH
-            std::cout<<"DB size: "<< DB_size / 1024 / 1024 <<"MB\n";
-        #endif
-
-        std::thread advancer;
-        std::cout << "Garbage collection: ";
-        if (enable_gc) {
-            std::cout << "enabled, running every " << gc_rate / 1000.0 << " ms";
-            Transaction::set_epoch_cycle(gc_rate);
-            advancer = std::thread(&Transaction::epoch_advancer, nullptr);
-        } else {
-            std::cout << "disabled";
-        }
-        std::cout << std::endl << std::flush;
 
 
         // Dimos - enable logging
@@ -1809,6 +1987,52 @@ public:
             logs = logset_map<LOG_NTABLES>::make(nlogger);
         }
 
+        std::cout << "Prepopulating database..." << std::endl;
+        prepopulate_db(db, db_numa_node);
+        std::cout << "Prepopulation complete." << std::endl;
+        
+        #if TPCH_REPLICA
+        std::cout<<"Copying database to the OLAP replica by replaying the logs...\n";
+        // store the OLAP DB in the NUMA node after the TPC-C DB NUMA node
+        always_assert(db_numa_node>=0, "Must run NUMA-aware for running the hybrid OLTP/OLAP with replicated DB!\n");
+        unsigned logdrainer_numa = (db_numa_node+1) % topo_info.num_nodes;
+        std::cout<<"Storing OLAP in NUMA node "<< logdrainer_numa<<std::endl;
+        auto & cpus = topo_info.cpu_id_list[logdrainer_numa];
+        // set the affinity of this thread to a CPU on the OLAP numa node
+        set_affinity(cpus[0]);
+        tpch_db olap_db(num_warehouses);
+        
+        // replicate the DB to the other OLAP node
+        if(LOGGING == 2){
+            replay_log(olap_db, db_numa_node, 0);
+            // reset the logs
+            for(unsigned i=0; i<nlogger; i++){
+                auto & log = (reinterpret_cast<logset_tbl<LOG_NTABLES>*>(logs))->log(i);
+                log.reset_all();
+            }
+        }
+        #endif
+
+        #if TPCH_SINGLE_NODE
+        db_profiler prof_tpch(spawn_perf, DB_size);
+        #endif
+
+        #if TPCH_SINGLE_NODE
+            std::cout<<"DB size: "<< DB_size / 1024 / 1024 <<"MB\n";
+        #endif
+
+        std::thread advancer;
+        std::cout << "Garbage collection: ";
+        if (enable_gc) {
+            std::cout << "enabled, running every " << gc_rate / 1000.0 << " ms";
+            Transaction::set_epoch_cycle(gc_rate);
+            advancer = std::thread(&Transaction::epoch_advancer, nullptr);
+        } else {
+            std::cout << "disabled";
+        }
+        std::cout << std::endl << std::flush;
+        
+
         #if TEST_HASHTABLE
             INIT_COUNTING
             for (uint64_t wid = 1; wid <= db.num_warehouses(); wid++){
@@ -1830,7 +2054,20 @@ public:
             cout<<"Hashtable lookup: "<< (double)latencies_hashtable_lookup[0][0]/latencies_hashtable_lookup[0][1] <<"("<<latencies_hashtable_lookup[0][1]<<")"<<endl;
         #endif
 
-        #if RUN_TPCH
+
+        #if RUN_TPCC
+        prof.start(profiler_mode);
+        #endif
+        #if TPCH_SINGLE_NODE
+            prof_tpch.start(profiler_mode);
+            run_benchmark(db, prof, prof_tpch, num_threads, run_cpus, run_tpch_cpus, time_limit, mix, verbose);
+        #else
+            auto txns_total = run_benchmark(db, prof, prof, num_threads, run_cpus, time_limit, mix, verbose);
+            prof.finish(txns_total);
+        #endif
+
+        /*
+        #if TPCH_SINGLE_NODE
             #if RUN_TPCC
             prof.start(profiler_mode);
             #endif
@@ -1844,14 +2081,16 @@ public:
             prof.finish(txns_total);
             #endif
         #endif
+        */
 
+        //#if LOG_STATS
         float total_log_sz=0;
         int total_log_records = 0;
         if(LOGGING==1){
             // inspect log:
             for(unsigned i=0; i<nlogger; i++){
                 auto & log = (reinterpret_cast<logset*>(logs))->log(i);
-                std::cout<<"Log "<<i<<" size: " << log.cur_log_records()<<", " << (float)log.current_size() / 1024 <<"KB\n";
+                //std::cout<<"Log "<<i<<" size: " << log.cur_log_records()<<", " << (float)log.current_size() / 1024 <<"KB\n";
                 total_log_sz+= (float)log.current_size() / 1024 / 1024;
                 total_log_records+= log.cur_log_records();
             }
@@ -1859,11 +2098,11 @@ public:
         else if(LOGGING == 2){
             for(unsigned i=0; i<nlogger; i++){
                 auto & log = (reinterpret_cast<logset_tbl<LOG_NTABLES>*>(logs))->log(i);
-                std::cout<<"Log "<<i<<":\n";
+                //std::cout<<"Log "<<i<<":\n";
                 for (int tbl=0; tbl<LOG_NTABLES; tbl++){
                     if(log.current_size(tbl)==0)
                         continue;
-                    std::cout<<"\tTable "<<tbl <<" size: "<< (float)log.current_size(tbl) / 1024 <<"KB\n";
+                    //std::cout<<"\tTable "<<tbl <<" size: "<< (float)log.current_size(tbl) / 1024 <<"KB\n";
                     total_log_sz+= (float)log.current_size(tbl) / 1024 / 1024;
                 }
                 total_log_records+= log.cur_log_records();
@@ -1872,39 +2111,39 @@ public:
         else if (LOGGING == 3){
             for(unsigned i=0; i<nlogger; i++){
                 auto & log = (reinterpret_cast<logset_map<LOG_NTABLES>*>(logs))->log(i);
-                std::cout<<"Log "<<i<<":\n";
+                //std::cout<<"Log "<<i<<":\n";
                 for (int tbl=0; tbl<LOG_NTABLES; tbl++){
                     if(log.current_size(tbl)==0 && log.cur_log_records(tbl)==0)
                         continue;
-                    std::cout<<"\tTable "<<tbl <<" size: "<< (float)log.current_size(tbl) / 1024 <<"KB\n";
+                    //std::cout<<"\tTable "<<tbl <<" size: "<< (float)log.current_size(tbl) / 1024 <<"KB\n";
                     total_log_sz+= (float)log.current_size(tbl) / 1024 / 1024;
                     total_log_records+= log.cur_log_records(tbl);
                 }
             }
         }
-        std::cout<<"Total log records: "<< total_log_records <<std::endl;
-        std::cout<<"Total log size (MB): "<< total_log_sz <<std::endl;
+        //std::cout<<"Total log records: "<< total_log_records <<std::endl;
+        //std::cout<<"Total log size (MB): "<< total_log_sz <<std::endl;
+        //#endif
 
         // parse the log!
-        #if REPLAY_LOG
+        #if LOGGING > 0 && REPLAY_LOG
+        log_replay_profiler rep_prof;
+        rep_prof.start();
         kvepoch_t to_epoch = 0; // replay the entire log
-        replay_log(db_numa_node, to_epoch, db.num_warehouses());
-        #endif
-
-
-        //std::cout<<"Size of order_value: "<<sizeof(struct order_value)<<std::endl;
-        //std::cout<<"Size of orderline_value: "<<sizeof(struct orderline_value)<<std::endl;
-
-        //std::cout<<"Size of order_key: "<<sizeof(struct order_key)<<std::endl;
-        //std::cout<<"Size of orderline_key: "<<sizeof(struct orderline_key)<<std::endl;
-        
-        
+        unsigned log_recs_replayed = replay_log(olap_db, db_numa_node, to_epoch);
+        rep_prof.finish(total_log_sz, log_recs_replayed, total_log_records);
+        #endif        
 
         size_t remaining_deliveries = 0;
         for (int wh = 1; wh <= db.num_warehouses(); wh++) {
             remaining_deliveries += db.delivery_queue().read(wh);
         }
         std::cout << "Remaining unresolved deliveries: " << remaining_deliveries << std::endl;
+
+        #if LOGGING > 0
+        std::cout<<"Verifying OLAP DB...\n";
+        verify_db(db, olap_db);
+        #endif
 
         if (enable_gc) {
             Transaction::global_epochs.run = false;
@@ -1918,10 +2157,13 @@ public:
             Transaction::tinfo[i].rcu_set.release_all();
         }
 
-        if(LOGGING==1) 
+        #if LOGGING==1 
             logset::free(reinterpret_cast<logset*>(logs));
-        else if(LOGGING==2)
+        #elif LOGGING==2
             logset_tbl<LOG_NTABLES>::free(reinterpret_cast<logset_tbl<LOG_NTABLES>*>(logs));
+        #elif LOGGING == 3
+            logset_map<LOG_NTABLES>::free(reinterpret_cast<logset_map<LOG_NTABLES>*>(logs));
+        #endif
 
         //std::cout<<"Done!\n";
         return 0;
