@@ -1277,7 +1277,7 @@ public:
                 // await on your log!
                 std::cout<< runner_num<<" WAITING...\n";
                 log.wait_to_logdrain();
-                std::cout<< runner_num<<" SIGNALED!\n";
+                std::cout<< runner_num<<" SIGNALED!\n";s
 
                 /* ================= LOG DRAIN START ============== */
                 // perform log drain!
