@@ -12,6 +12,8 @@
 #include <mutex>
 
 
+#include <map>
+
 
 #include "../util/measure_latencies.hh"
 
@@ -78,6 +80,11 @@ static uint64_t latencies_orderline_scan[tpch_thrs_size][2];
 #define LOG_DRAIN_REQUEST 1 // the log drainer threads will set a boolean flag in the log they request to drain
 
 #define NLOGGERS 10
+#define MAX_TPCC_THREADS 10
+// 1: std::unordered_map at OLTP side
+// 2: STO uindex at OLTP side
+// 3: STO uindex at OLAP side
+#define DICTIONARY 3
 // when to add to log
 // 1 for cleanup, 2 for install
 #define ADD_TO_LOG (LOGGING>0? 2 : 0)
@@ -120,6 +127,9 @@ namespace tpcc {
 #include "TPCH_runner.hh"
 
 extern kvepoch_t global_log_epoch;
+
+static bool start_logdrain; // we need to make sure no log drain threads attempt to perform a log drain if the rest threads don't! Otherwise they will get stuck in the barrier. That's why we let only the designated thread to decide!
+static bool tpch_done;
 
 using tpch::tpch_db;
 
@@ -270,6 +280,22 @@ class tpcc_access;
 template <typename DBParams>
 class tpcc_db {
 public:
+    #if DICTIONARY == 1
+    // dictionary
+    std::unordered_map<std::string, int> dict [MAX_TPCC_THREADS];
+    //std::vector<int> vec;
+    #elif DICTIONARY == 2
+    struct StrId {
+        enum class NamedColumn : int { 
+            id = 0
+        };
+        StrId(int id) : id_(id) {}
+        int id_;
+    };
+    using dict_t = unordered_index<std::string, StrId, db_params::db_default_params>;
+    dict_t dict[MAX_TPCC_THREADS];
+    #endif
+
     template <typename K, typename V>
     using OIndex = typename std::conditional<DBParams::MVCC,
           mvcc_ordered_index<K, V, DBParams>,
@@ -643,6 +669,14 @@ tpcc_db<DBParams>::tpcc_db(int num_whs)
 #endif
       oid_gen_()
        {
+        // dictionary
+        #if DICTIONARY == 1
+        for(int i=0; i<MAX_TPCC_THREADS; i++)
+            dict[i] = std::unordered_map<std::string, int> (4000000);
+        #elif DICTIONARY == 2
+        for(int i=0; i<MAX_TPCC_THREADS; i++)
+            dict[i] = dict_t (4000000);
+        #endif
     //constexpr size_t num_districts = NUM_DISTRICTS_PER_WAREHOUSE;
     //constexpr size_t num_customers = NUM_CUSTOMERS_PER_DISTRICT * NUM_DISTRICTS_PER_WAREHOUSE;
 
@@ -1222,6 +1256,7 @@ public:
             }
         }
     }
+
     static void tpch_replica_runner_thread(void* olap_db, db_profiler& prof, int runner_id, int runner_num, double time_limit, uint64_t& q_cnt){
         INIT_COUNTING_PRINT
         (void)runner_num;
@@ -1243,9 +1278,20 @@ public:
 
         uint64_t q_cnt_lcl = 0;
 
+        if(runner_num == 0){
+            tpch_done = false;
+            start_logdrain = false;
+        }
+
         while(true){
             auto curr_t = read_tsc();
-            if ((curr_t - start_t) >= tsc_diff) { // done
+            // only the designated thread should decide whether TPC-H is done or not. If not, it could be that some threads wait for the barrier to perform log drain wile other threads decided to be done!
+            if (runner_num == 0 && (curr_t - start_t) >= tsc_diff) { // done
+                tpch_done = true;
+                q_cnt = q_cnt_lcl;
+                break;
+            }
+            if(tpch_done){
                 q_cnt = q_cnt_lcl;
                 break;
             }
@@ -1254,13 +1300,22 @@ public:
             //STOP_COUNTING(q_latencies, runner_num)
             q_cnt_lcl++;
             #if TPCH_REPLICA && LOG_DRAIN_REQUEST
-            if(div>0 && (curr_t - last_drain) >= tsc_diff/div){ // if timeout reached, trigger log replay to refresh OLAP DB!
+            curr_t = read_tsc();
+            // if timeout reached in designated thread, trigger log replay to refresh OLAP DB!
+            // if we are near the end, do not perform log drain!
+            // we need to adjust time_limit (-2, or -3) depending on the log drain frequency.
+            bool near_the_end = false; //=  ((curr_t - start_t) >=  (uint64_t)(time_limit-1) * constants::processor_tsc_frequency * constants::billion);
+            if(runner_num == 0 && div>0 && (curr_t - last_drain) >= tsc_diff/div &&  !near_the_end){
+                start_logdrain = true;
+            }
+            if(runner_num == 0 && near_the_end){
+                tpch_done = true;
                 q_cnt = q_cnt_lcl;
-                // if we are near the end, do not perform log drain!
-                if((curr_t - start_t) >=  (uint64_t)(time_limit-1) * constants::processor_tsc_frequency * constants::billion){ // we need to adjust time_limit (-2, or -3) depending on the log drain frequency.
-                    break;
-                }
-                START_COUNTING_PRINT
+                break;
+            }
+
+            if(start_logdrain) {
+                q_cnt = q_cnt_lcl;
                 /* ================= LOG DRAIN PREPARE ============== */
                 int r = pthread_barrier_wait(&dbsync_barrier);
                 always_assert(r == PTHREAD_BARRIER_SERIAL_THREAD || r == 0, "Error in pthread_barrier_wait");
@@ -1269,16 +1324,14 @@ public:
                 auto & log = (reinterpret_cast<logset_tbl<LOG_NTABLES>*>(logs))->log(runner_num);
                 // advance log epoch and sync DB
                 if(runner_num == 0){
-                    std::cout<<"---\n";
-                    usleep(100); // do not change the global epoch right away, since some threads will miss the log writer's signal before they call wait.
+                    start_logdrain = false;
+                    usleep(20); // do not change the global epoch right away, since some threads will miss the log writer's signal before they call wait.
                     global_log_epoch++;
                     //std::cout<<"Set log epoch to "<< global_log_epoch.value()<<std::endl;
                 }
                 // await on your log!
-                std::cout<< runner_num<<" WAITING...\n";
                 log.wait_to_logdrain();
-                std::cout<< runner_num<<" SIGNALED!\n";
-
+                
                 /* ================= LOG DRAIN START ============== */
                 // perform log drain!
 
@@ -1287,13 +1340,14 @@ public:
                     return log_op_apply_tpch(*dbp, true, key, val, ts, cmd, tbl);
                 };
                 int recs_replayed = 0;
+                START_COUNTING_PRINT
                 for (int tbl=0; tbl<LOG_NTABLES; tbl++){
                     if(log.current_size(tbl)==0)
                         continue;
                     // watch out! The log.current_size(tbl) is concurrently updated by the log writers (tpc-c)!
                     recs_replayed += logreplays[runner_num][tbl]-> template replay<decltype(callBack)> (current_epoch, log.current_size(tbl), callBack, tbl); // replay up to the epoch before the advance!
                 }
-                std::cout<< runner_num<<" Done replaying!\n";
+                STOP_COUNTING_PRINT(print_mutex, runner_num, recs_replayed)
                 //std::cout<<"Replayed "<< recs_replayed<<std::endl;
                 /* ================= LOG DRAIN END ============== */
                 /* ================= TPC-H QUERIES PREPARE ============== */
@@ -1301,12 +1355,10 @@ public:
                 always_assert(r == PTHREAD_BARRIER_SERIAL_THREAD || r == 0, "Error in pthread_barrier_wait");
                 // continue with TPCH queries!
                 //STOP_COUNTING(drain_latencies, runner_num)
-                STOP_COUNTING_PRINT(print_mutex, runner_num, recs_replayed)
                 last_drain = read_tsc();
-                std::cout<< runner_num<<" All done!\n";
             }
             #endif
-        }
+        }        
     }
 
     // runner_id:  the id of the CPU that will run this thread
@@ -1563,7 +1615,11 @@ public:
         }
         prof_tpch.finish(q_total_count, tpch_end);
 
-
+        // inspect dictionary!
+        /*for(int i=0; i<db.num_warehouses(); i++){
+            std::cout<<"Dict size: "<< db.tbl_orderlines(i).dict.size()<<std::endl;
+            std::cout<<"Vect size: "<< db.tbl_orderlines(i).vec.size()<<std::endl;
+        }*/
         
         
         #if TPCH_REPLICA && LOG_DRAIN_REQUEST
