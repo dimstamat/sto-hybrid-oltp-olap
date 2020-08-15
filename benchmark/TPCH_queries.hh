@@ -97,46 +97,9 @@ namespace tpch {
         auto filter_by_delivery_d = [&result, &cur_o_entry_d, &exists, &scan_elems_n, this] (const tpcc::orderline_key&, const tpcc::orderline_value&olv) -> bool {
             if(olv.ol_delivery_d >= cur_o_entry_d){ // condition is satisfied! An order that statisfies the condition exists!
                 exists = true;
-                #if DICTIONARY == 1
-                const char* str = tpcc::tpcc_db<DBParams>::decode(olv.ol_dist_info);
-                #else
-                const char* str = olv.ol_dist_info.c_str();
-                #endif
-                strcmp(str, str1_to_cmp.c_str());
-                #if LARGE_DUMMY_COLS > 0
-                #if DICTIONARY == 1
-                const char* str1 = tpcc::tpcc_db<DBParams>::decode(olv.ol_dummy_str1);
-                const char* str2 = tpcc::tpcc_db<DBParams>::decode(olv.ol_dummy_str2);
-                const char* str3 = tpcc::tpcc_db<DBParams>::decode(olv.ol_dummy_str3);
-                const char* str4 = tpcc::tpcc_db<DBParams>::decode(olv.ol_dummy_str4);
-                #else
-                const char* str1 = olv.ol_dummy_str1.c_str();
-                const char* str2 = olv.ol_dummy_str2.c_str();
-                const char* str3 = olv.ol_dummy_str3.c_str();
-                const char* str4 = olv.ol_dummy_str4.c_str();
-                #endif
-                strcmp(str1, str2_to_cmp.c_str());
-                strcmp(str2, str2_to_cmp.c_str());
-                strcmp(str3, str2_to_cmp.c_str());
-                strcmp(str4, str2_to_cmp.c_str());
-                #endif
-                #if LARGE_DUMMY_COLS == 2
-                #if DICTIONARY == 1
-                const char* str5 = tpcc::tpcc_db<DBParams>::decode(olv.ol_dummy_str5);
-                const char* str6 = tpcc::tpcc_db<DBParams>::decode(olv.ol_dummy_str6);
-                const char* str7 = tpcc::tpcc_db<DBParams>::decode(olv.ol_dummy_str7);
-                const char* str8 = tpcc::tpcc_db<DBParams>::decode(olv.ol_dummy_str8);
-                #else
-                const char* str5 = olv.ol_dummy_str5.c_str();
-                const char* str6 = olv.ol_dummy_str6.c_str();
-                const char* str7 = olv.ol_dummy_str7.c_str();
-                const char* str8 = olv.ol_dummy_str8.c_str();
-                #endif
-                strcmp(str5, str2_to_cmp.c_str());
-                strcmp(str6, str2_to_cmp.c_str());
-                strcmp(str7, str2_to_cmp.c_str());
-                strcmp(str8, str2_to_cmp.c_str());
-                #endif
+                //#if DICTIONARY == 1
+                //const char* str = tpcc::tpcc_db<DBParams>::decode(olv.ol_dist_info);
+                //#endif
             }
             scan_elems_n++;
             return true;
