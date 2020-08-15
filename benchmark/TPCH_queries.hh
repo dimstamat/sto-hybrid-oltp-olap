@@ -2,7 +2,7 @@
 
 // in order to use the TPC-C related structs
 
-#define RUN_OCC 1
+#define RUN_OCC 0
 
 // from Transaction.hh
 static constexpr unsigned tset_max_capacity = 32768;
@@ -17,24 +17,27 @@ static constexpr unsigned tset_max_capacity = 32768;
 // total days:
 // leap years: 1992, 1996
 // 365*7 + 2 = 2,557
-#if RUN_TPCH 
 
 namespace tpch {
-
     /**********
     * QUERY 4 *
     ***********/
     template <typename DBParams>
     void tpch_runner<DBParams>::run_query4(){
-        INIT_COUNTING
+        //INIT_COUNTING_PRINT
         typedef tpcc::order_sec_key::oid_type oid_type;
         typedef tpcc::order_sec_key::wdid_type wdid_type;
 
         //typedef typename std::remove_reference_t<decltype(db.tbl_sec_orders())>::internal_elem internal_elem;
-        #if RUN_OCC
+        /*#if RUN_OCC
         typedef bench::ordered_index<tpcc::order_key, tpcc::order_value, db_params::db_default_params>::internal_elem internal_elem;
         #else
         typedef bench::mvcc_ordered_index<tpcc::order_key, tpcc::order_value, db_params::db_mvcc_params>::internal_elem internal_elem;
+        #endif*/
+        #if TPCH_SINGLE_NODE
+            typedef bench::mvcc_ordered_index<tpcc::order_key, tpcc::order_value, db_params::db_mvcc_params>::internal_elem internal_elem;
+        #else
+            typedef bench::ordered_index<tpcc::order_key, tpcc::order_value, db_params::db_default_params>::internal_elem internal_elem;
         #endif
         
 
@@ -54,6 +57,7 @@ namespace tpch {
         };
         
 
+        int scan_elems_n = 0; // how many elements found during scan
 
         // holding all orders with entry dates between specified range
         vector<result_cols> intermediate_res;
@@ -67,31 +71,74 @@ namespace tpch {
         // a) get the o_ol_cnt later on that we further filter the orders based on the final predicates and this will
         //  save us from a few internal_elem*  dereferences that would be random memory access!
         // b) get o_ol_cnt now since we already scan the secondary orders table!
-        auto add_entry_d_callback = [&intermediate_res] (const tpcc::order_sec_key& ok, const tpcc::order_sec_value& ov) -> bool {
+        auto add_entry_d_callback = [&intermediate_res, &scan_elems_n] (const tpcc::order_sec_key& ok, const tpcc::order_sec_value& ov) -> bool {
             // read the value from the primary index through the internal_elem that is stored as value in the secondary index
             // we can fetch the orderline_count value later on! (Late materialization)
             internal_elem* e = reinterpret_cast<internal_elem*>(ov.o_c_entry_d_p);
             #if !LATE_MATERIALIZATION
-                #if RUN_OCC
-                auto vp = &e->row_container.row;
+                #if TPCH_SINGLE_NODE
+                    auto *h = e->row.find(Sto::read_tid<DBParams::Commute>());
+                    //auto *h = e->row.find(Sto::read_tid<DBParams::Commute>(), false); // it is not correct to not wait for PENDING! This can result to some elements from the future and some from the past! (different snapshots)
+                    if (h->status_is(UNUSED)){
+                        always_assert(false, "history status is UNUSED!");
+                    }
+                    auto vp = h->vp();
                 #else
-                auto *h = e->row.find(Sto::read_tid<DBParams::Commute>());
-                if (h->status_is(UNUSED)){
-                    always_assert(false, "history status is UNUSED!");
-                }
-                auto vp = h->vp();
+                    auto vp = &e->row_container.row;
                 #endif
-            
-            intermediate_res.emplace_back(result_cols(bswap(ok.o_entry_d), vp->o_ol_cnt, bswap(ok.o_w_id), bswap(ok.o_d_id), bswap(ok.o_id)));
+                intermediate_res.emplace_back(result_cols(bswap(ok.o_entry_d), vp->o_ol_cnt, bswap(ok.o_w_id), bswap(ok.o_d_id), bswap(ok.o_id)));
             #else
             intermediate_res.emplace_back(result_cols(e, bswap(ok.o_entry_d), 0, bswap(ok.o_w_id), bswap(ok.o_d_id), bswap(ok.o_id)));
             #endif
+            scan_elems_n++;
             return true;
         };
 
-        auto filter_by_delivery_d = [&result, &cur_o_entry_d, &exists] (const tpcc::orderline_key&, const tpcc::orderline_value&olv) -> bool {
-            if(olv.ol_delivery_d >= cur_o_entry_d) // condition is satisfied! An order that statisfies the condition exists!
+        auto filter_by_delivery_d = [&result, &cur_o_entry_d, &exists, &scan_elems_n, this] (const tpcc::orderline_key&, const tpcc::orderline_value&olv) -> bool {
+            if(olv.ol_delivery_d >= cur_o_entry_d){ // condition is satisfied! An order that statisfies the condition exists!
                 exists = true;
+                #if DICTIONARY == 1
+                const char* str = tpcc::tpcc_db<DBParams>::decode(olv.ol_dist_info);
+                #else
+                const char* str = olv.ol_dist_info.c_str();
+                #endif
+                strcmp(str, str1_to_cmp.c_str());
+                #if LARGE_DUMMY_COLS > 0
+                #if DICTIONARY == 1
+                const char* str1 = tpcc::tpcc_db<DBParams>::decode(olv.ol_dummy_str1);
+                const char* str2 = tpcc::tpcc_db<DBParams>::decode(olv.ol_dummy_str2);
+                const char* str3 = tpcc::tpcc_db<DBParams>::decode(olv.ol_dummy_str3);
+                const char* str4 = tpcc::tpcc_db<DBParams>::decode(olv.ol_dummy_str4);
+                #else
+                const char* str1 = olv.ol_dummy_str1.c_str();
+                const char* str2 = olv.ol_dummy_str2.c_str();
+                const char* str3 = olv.ol_dummy_str3.c_str();
+                const char* str4 = olv.ol_dummy_str4.c_str();
+                #endif
+                strcmp(str1, str2_to_cmp.c_str());
+                strcmp(str2, str2_to_cmp.c_str());
+                strcmp(str3, str2_to_cmp.c_str());
+                strcmp(str4, str2_to_cmp.c_str());
+                #endif
+                #if LARGE_DUMMY_COLS == 2
+                #if DICTIONARY == 1
+                const char* str5 = tpcc::tpcc_db<DBParams>::decode(olv.ol_dummy_str5);
+                const char* str6 = tpcc::tpcc_db<DBParams>::decode(olv.ol_dummy_str6);
+                const char* str7 = tpcc::tpcc_db<DBParams>::decode(olv.ol_dummy_str7);
+                const char* str8 = tpcc::tpcc_db<DBParams>::decode(olv.ol_dummy_str8);
+                #else
+                const char* str5 = olv.ol_dummy_str5.c_str();
+                const char* str6 = olv.ol_dummy_str6.c_str();
+                const char* str7 = olv.ol_dummy_str7.c_str();
+                const char* str8 = olv.ol_dummy_str8.c_str();
+                #endif
+                strcmp(str5, str2_to_cmp.c_str());
+                strcmp(str6, str2_to_cmp.c_str());
+                strcmp(str7, str2_to_cmp.c_str());
+                strcmp(str8, str2_to_cmp.c_str());
+                #endif
+            }
+            scan_elems_n++;
             return true;
         };
 
@@ -107,21 +154,36 @@ namespace tpch {
         uint32_t start_date = ig.gen_date(0.143*ig.get_total_dates()+ig.get_min_date(), 0.821*ig.get_total_dates() + ig.get_min_date());
         uint32_t end_date = start_date + 0.035*ig.get_total_dates(); // start_date + 3 months (90 days - 3.5% of all days)
         //std::cout<<"Start date: "<<start_date<<", end date: "<<end_date<<std::endl;
+        #if TPCH_SINGLE_NODE
         TXN{
+        #endif
             // clear the previous intermediate_res if it's a retry!
             if(retried){
                 intermediate_res.clear();
                 result.clear();
                 exists = false;
+                scan_elems_n = 0;
             }
             tpcc::order_sec_key k0(start_date, 0, 0, 0);
             tpcc::order_sec_key k1(end_date, max_wdid, max_wdid, max_oid);
-            START_COUNTING
-            bool success = db.tbl_sec_orders()
+            //START_COUNTING_PRINT
+            bool success = false;
+            #if TPCH_SINGLE_NODE
+            success = (reinterpret_cast<tpcc::hybrid_db<DBParams>*>(db))->tbl_sec_orders()
                     .template range_scan<decltype(add_entry_d_callback), false/*no reverse*/>(true /*read-only access - no TItems*/, k0, k1, add_entry_d_callback, tpcc::RowAccess::None, false /* No Phantom protection*/);
-            STOP_COUNTING(latencies_sec_ord_scan, ((runner_id-40) / 4))
+            #else
+            success = (reinterpret_cast<tpch_db*>(db))->tbl_sec_orders()
+                    .template nontrans_range_scan<decltype(add_entry_d_callback), false/*no reverse*/>(k0, k1, add_entry_d_callback);
+            #endif
+            //STOP_COUNTING(latencies_sec_ord_scan, ((runner_id-40) / 4))
+            //STOP_COUNTING_PRINT(tpcc::print_mutex, "orders", scan_elems_n)
+            scan_elems_n=0;
             retried = true;
+            #if TPCH_SINGLE_NODE
             CHK(success);
+            #else
+            assert(success);
+            #endif
 
             // step 2 - for each encountered order, check whether ol_delivery_d >= o_entry_d
             for(auto order : intermediate_res){
@@ -131,31 +193,49 @@ namespace tpch {
                 // stop as soon as we find at least one order that satisfies the condition!
                 // TODO: Make range_scan to stop when a condition is satisifed!
                 cur_o_entry_d = order.o_entry_d;
-                START_COUNTING
-                bool success = db.tbl_orderlines(order.o_wid)
+                //START_COUNTING_PRINT
+                bool success = false;
+                #if TPCH_SINGLE_NODE
+                    success = (reinterpret_cast<tpcc::hybrid_db<DBParams>*>(db))->tbl_orderlines(order.o_wid)
                                 .template range_scan<decltype(filter_by_delivery_d), false> (true /*read-only access - no TItems*/, k0, k1, filter_by_delivery_d, tpcc::RowAccess::None, false /*No Phantom protection*/);
-                STOP_COUNTING(latencies_orderline_scan, ((runner_id-40) / 4))
+                #else
+                    success = (reinterpret_cast<tpch_db*>(db))->tbl_orderlines(order.o_wid)
+                    .template nontrans_range_scan<decltype(filter_by_delivery_d), false/*no reverse*/>(k0, k1, filter_by_delivery_d);
+                #endif
+
+                //STOP_COUNTING_PRINT(tpcc::print_mutex, "orderlines", scan_elems_n)
+                //STOP_COUNTING(latencies_orderline_scan, ((runner_id-40) / 4))
                 retried = true;
+                #if TPCH_SINGLE_NODE
                 CHK(success);
+                #else
+                assert(success);
+                #endif
                 if(exists){
                     #if LATE_MATERIALIZATION
-                        #if RUN_OCC
-                        auto vp = e->row_container.row;
-                        #else
+                        #if TPCH_SIGLE_NODE
                         auto *h = order.el->row.find(Sto::read_tid<DBParams::Commute>());
                         if (h->status_is(UNUSED)){
                             always_assert(false, "history status is UNUSED!");
                         }
                         auto vp = h->vp();
+                        order.o_ol_cnt = vp->o_ol_cnt;
+                        #else
+                        auto vp = order.el->row_container.row;
+                        order.o_ol_cnt = vp.o_ol_cnt;
                         #endif
-                    order.o_ol_cnt = vp->o_ol_cnt;
                     #endif
                     result.emplace_back(order);
                 }
             }
 
+        #if TPCH_SINGLE_NODE
         }TEND(true);
+        #endif
         //std::cout<< "Found "<< intermediate_res.size() <<" intermediate results and "<< result.size() <<" final\n";
+        
+        // materialized views experiment
+        //(reinterpret_cast<tpch_db*>(db))->add_date(start_date);
     }
 
     template <typename DBParams>
@@ -174,5 +254,3 @@ namespace tpch {
     }
 
 }
-
-#endif
