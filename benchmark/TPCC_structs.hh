@@ -958,16 +958,7 @@ struct orderline_value {
                                    ol_delivery_d,
                                    ol_quantity,
                                    ol_amount,
-                                   ol_dist_info 
-                                   #if LARGE_DUMMY_COLS > 0
-                                   , ol_dummy_str1, ol_dummy_str2,
-                                   ol_dummy_str3, ol_dummy_str4
-                                   #endif
-                                   #if LARGE_DUMMY_COLS == 2
-                                   , ol_dummy_str5, ol_dummy_str6,
-                                   ol_dummy_str7, ol_dummy_str8
-                                   #endif
-                                   };
+                                   ol_dist_info };
 
     uint64_t       ol_i_id;
     uint64_t       ol_supply_w_id;
@@ -976,32 +967,8 @@ struct orderline_value {
     int32_t        ol_amount;
     #if DICTIONARY == 1 || DICTIONARY == 2
     uint32_t        ol_dist_info;
-    #if LARGE_DUMMY_COLS > 0
-    uint32_t        ol_dummy_str1;
-    uint32_t        ol_dummy_str2;
-    uint32_t        ol_dummy_str3;
-    uint32_t        ol_dummy_str4;
-    #endif
-    #if LARGE_DUMMY_COLS == 2
-    uint32_t        ol_dummy_str5;
-    uint32_t        ol_dummy_str6;
-    uint32_t        ol_dummy_str7;
-    uint32_t        ol_dummy_str8;
-    #endif    
     #else
     fix_string<24> ol_dist_info;
-    #if LARGE_DUMMY_COLS > 0
-    fix_string<72> ol_dummy_str1;
-    fix_string<72> ol_dummy_str2;
-    fix_string<72> ol_dummy_str3;
-    fix_string<72> ol_dummy_str4;
-    #endif
-    #if LARGE_DUMMY_COLS == 2
-    fix_string<72> ol_dummy_str5;
-    fix_string<72> ol_dummy_str6;
-    fix_string<72> ol_dummy_str7;
-    fix_string<72> ol_dummy_str8;
-    #endif
     #endif
 
     orderline_value(){}
