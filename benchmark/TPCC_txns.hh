@@ -7,10 +7,13 @@
 #define TPCC_OBSERVE_C_BALANCE 1
 #endif
 
+#define UPDATE_ROW_FIXED 1
+
 namespace tpcc {
 
 template <typename DBParams>
 void tpcc_runner<DBParams>::run_txn_neworder() {
+    hybrid_db<DBParams>& db_h = reinterpret_cast<hybrid_db<DBParams>&>(db); // it will only be accessed if db.get_type() is hybrid
 #if TABLE_FINE_GRAINED
     typedef warehouse_value::NamedColumn wh_nc;
     typedef district_value::NamedColumn dt_nc;
@@ -187,26 +190,26 @@ void tpcc_runner<DBParams>::run_txn_neworder() {
     ov->o_entry_d = o_entry_d;
     ov->o_ol_cnt = num_items;
 
-#if RUN_TPCH
-    // get the pointer of the internal_elem that stores the given key!
-    uint64_t* el;
-    std::tie(abort, result) = db.tbl_orders(q_w_id).insert_row(ok, ov, false, false, true, &el);
-    CHK(abort);
-    assert(!result);
-    // insert into the secondary index also
-    order_sec_value * val = Sto::tx_alloc<order_sec_value>();
-    // store the location of the internal element
-    val->o_c_entry_d_p = el;
-    std::tie(abort, result) = db.tbl_sec_orders().insert_row(order_sec_key(o_entry_d, q_w_id, q_d_id, dt_next_oid), val, false);
-    CHK(abort);
-    assert(!result);
-#else
-    std::tie(abort, result) = db.tbl_orders(q_w_id).insert_row(ok, ov, false);
-    //std::cout<<"Should add log\n";
-    CHK(abort);
-    assert(!result);
-#endif
-
+    if(hybrid){
+        // get the pointer of the internal_elem that stores the given key!
+        uint64_t* el;
+        std::tie(abort, result) = db_h.tbl_orders(q_w_id).insert_row(ok, ov, false, false, true, &el);
+        CHK(abort);
+        assert(!result);
+        // insert into the secondary index also
+        order_sec_value * val = Sto::tx_alloc<order_sec_value>();
+        // store the location of the internal element
+        val->o_c_entry_d_p = el;
+        std::tie(abort, result) = db_h.tbl_sec_orders().insert_row(order_sec_key(o_entry_d, q_w_id, q_d_id, dt_next_oid), val, false);
+        CHK(abort);
+        assert(!result);
+    }
+    else{
+        std::tie(abort, result) = db.tbl_orders(q_w_id).insert_row(ok, ov, false);
+        //std::cout<<"Should add log\n";
+        CHK(abort);
+        assert(!result);
+    }
 #endif
 
     std::tie(abort, result) = db.tbl_neworders(q_w_id).insert_row(ok, &bench::dummy_row::row, false);
@@ -275,7 +278,11 @@ void tpcc_runner<DBParams>::run_txn_neworder() {
              {st_nc::s_dists, access_t::read },
              {st_nc::s_data, access_t::read }}
 #else
-            RowAccess::ObserveValue
+            #if UPDATE_ROW_FIXED
+            RowAccess::UpdateValue
+            #else
+            RowAccess::ObserveValue  // Dimos - must use UpdateValue in order to add to write set!
+            #endif
 #endif
         );
         CHK(abort);
@@ -333,7 +340,43 @@ void tpcc_runner<DBParams>::run_txn_neworder() {
         olv->ol_delivery_d = 0;
         olv->ol_quantity = qty;
         olv->ol_amount = ol_amount;
+
+        // s_dist is alredy encoded, no need to encode it here!
+        /*#if DICTIONARY == 1 || DICTIONARY == 2
+        std::string s = std::string(s_dist);
+        int log_id = reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(db.tbl_orderlines(q_w_id).ti->logger_tbl())->get_log_index();
+        olv->ol_dist_info = db.encode(log_id, s);
+        #else
+        */
         olv->ol_dist_info = s_dist;
+        #if DICTIONARY == 1
+        #if LARGE_DUMMY_COLS > 0
+        olv->ol_dummy_str1 = s_dist;
+        olv->ol_dummy_str2 = s_dist;
+        olv->ol_dummy_str3 = s_dist;
+        olv->ol_dummy_str4 = s_dist;
+        #endif
+        #if LARGE_DUMMY_COLS == 2
+        olv->ol_dummy_str5 = s_dist;
+        olv->ol_dummy_str6 = s_dist;
+        olv->ol_dummy_str7 = s_dist;
+        olv->ol_dummy_str8 = s_dist;
+        #endif
+        #else
+        #if LARGE_DUMMY_COLS > 0
+        olv->ol_dummy_str1.set_3_times(s_dist);
+        olv->ol_dummy_str2.set_3_times(s_dist);
+        olv->ol_dummy_str3.set_3_times(s_dist);
+        olv->ol_dummy_str4.set_3_times(s_dist);
+        #endif
+        #if LARGE_DUMMY_COLS == 2
+        olv->ol_dummy_str5.set_3_times(s_dist);
+        olv->ol_dummy_str6.set_3_times(s_dist);
+        olv->ol_dummy_str7.set_3_times(s_dist);
+        olv->ol_dummy_str8.set_3_times(s_dist);
+        #endif
+        #endif
+
 
     #if 0
         // get the pointer of the internal_elem that stores the given key!
@@ -479,7 +522,11 @@ void tpcc_runner<DBParams>::run_txn_payment() {
          {wh_nc::w_zip, access_t::read},
          {wh_nc::w_ytd, Commute ? access_t::write : access_t::update}}
 #else
-        RowAccess::ObserveValue
+        #if UPDATE_ROW_FIXED
+        RowAccess::UpdateValue
+        #else
+        RowAccess::ObserveValue  // Dimos - must use UpdateValue in order to add to write set!
+        #endif
 #endif
     );
     CHK(success);
@@ -546,7 +593,11 @@ void tpcc_runner<DBParams>::run_txn_payment() {
          {dt_nc::d_zip, access_t::read},
          {dt_nc::d_ytd, Commute ? access_t::write : access_t::update}}
 #else
-        RowAccess::ObserveValue
+        #if UPDATE_ROW_FIXED
+        RowAccess::UpdateValue
+        #else
+        RowAccess::ObserveValue  // Dimos - must use UpdateValue in order to add to write set!
+        #endif
 #endif
     );
     CHK(success);
@@ -653,7 +704,11 @@ void tpcc_runner<DBParams>::run_txn_payment() {
          {cu_nc::c_ytd_payment, Commute ? access_t::write : access_t::update},
          {cu_nc::c_credit, Commute ? access_t::write : access_t::update}}
 #else
-        RowAccess::ObserveValue
+        #if UPDATE_ROW_FIXED
+        RowAccess::UpdateValue
+        #else
+        RowAccess::ObserveValue  // Dimos - must use UpdateValue in order to add to write set!
+        #endif
 #endif
     );
     CHK(success);
@@ -1013,7 +1068,11 @@ void tpcc_runner<DBParams>::run_txn_delivery(uint64_t q_w_id,
              {od_nc::o_ol_cnt, access_t::read},
              {od_nc::o_carrier_id, Commute ? access_t::write : access_t::update}}
 #else
-            RowAccess::ObserveValue
+            #if UPDATE_ROW_FIXED
+            RowAccess::UpdateValue
+            #else
+            RowAccess::ObserveValue // Dimos - change this so that to include item in the write set!!
+            #endif
 #endif
         );
         CHK(success);
@@ -1121,7 +1180,11 @@ void tpcc_runner<DBParams>::run_txn_delivery(uint64_t q_w_id,
             {{cu_nc::c_balance, Commute ? access_t::write : access_t::update},
              {cu_nc::c_delivery_cnt, Commute ? access_t::write : access_t::update}}
 #else
-            RowAccess::ObserveValue
+            #if UPDATE_ROW_FIXED
+            RowAccess::UpdateValue
+            #else
+            RowAccess::ObserveValue  // Dimos - must use UpdateValue in order to add to write set!
+            #endif
 #endif
         );
         CHK(success);
@@ -1144,10 +1207,53 @@ void tpcc_runner<DBParams>::run_txn_delivery(uint64_t q_w_id,
 
     } TEND(true);
 
+
+    
+
+
     last_delivered = delivered_order_ids;
 
     TXP_INCREMENT(txp_tpcc_dl_commits);
     TXP_ACCOUNT(txp_tpcc_dl_aborts, starts - 1);
+
+
+    #if 0
+    TXN {
+        // verify!
+        for (uint64_t q_d_id = 1; q_d_id <= 10; ++q_d_id) {
+            //order_id = 0;
+            //order_key k0(q_w_id, q_d_id, last_delivered[q_d_id - 1]);
+            //order_key k1(q_w_id, q_d_id, std::numeric_limits<order_key::oid_type>::max());
+            
+            
+            //success = db.tbl_neworders(q_w_id)
+            //        .template nontrans_range_scan<decltype(no_scan_callback), false/*reverse*/>(k0, k1, no_scan_callback, 1);
+            //assert(success);
+            
+            //success = db.tbl_neworders(q_w_id)
+            //        .template range_scan<decltype(no_scan_callback), false/*reverse*/>(k0, k1, no_scan_callback, RowAccess::ObserveValue, true, 1);
+            //CHK(success);
+            order_id = delivered_order_ids[q_d_id-1];
+            if (order_id == 0)
+                continue;
+
+
+            order_key ok(q_w_id, q_d_id, order_id);
+
+            bool success, result;
+            uintptr_t row;
+            const void *value;
+
+            std::cout<<"Order_id: "<<order_id<<std::endl;
+            std::tie(success, result, row, value) = db.tbl_orders(q_w_id).select_row(ok, RowAccess::ObserveValue);
+            const order_value * v = reinterpret_cast<const order_value*>(value);
+            CHK(success);
+            //order_value * v = db.tbl_orders(q_w_id).nontrans_get(ok);
+            assert(v);
+            assert(v->o_carrier_id > 0);
+        }
+    } TEND(true);
+    #endif
 }
 
 template <typename DBParams>
