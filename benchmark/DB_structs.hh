@@ -166,6 +166,17 @@ public:
         return const_cast<fix_string &>(*this);
     }
 
+    // to set the contents of this string as a smaller string, twice
+    void set_3_times(const fix_string<24> &rhs) {
+        memcpy(s_, rhs.c_str(), 24);
+        memcpy(s_+24, rhs.c_str(), 24);
+        memcpy(s_+48, rhs.c_str(), 24);
+    }
+
+    const char* c_str() const {
+        return s_;
+    }
+
     explicit operator std::string() {
         return std::string(s_, FL);
     }
@@ -221,7 +232,7 @@ struct dummy_row {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() {
+    const char* to_str() {
         return "";
     }
 
