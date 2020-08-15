@@ -97,7 +97,6 @@ static uint64_t latencies_orderline_scan[tpch_thrs_size][2];
 // 3: std::unordered_map at OLAP side
 // 4: STO uindex at OLAP side
 #define DICTIONARY 0
-#define LARGE_DUMMY_COLS 2
 // the initial size that we allocate for the dictionary (number of buckets in the map)
 #define INIT_DICT_SZ 2000000
 // the maximum size for the dictionary (the size of the static array)
@@ -1180,49 +1179,8 @@ void tpcc_prepopulator<DBParams>::expand_customers(uint64_t wid) {
                 auto ol_dist_info_str = random_a_string(24, 24);
                 std::string s(ol_dist_info_str);
                 olv.ol_dist_info = db.encode(wid-1, s);
-                #if LARGE_DUMMY_COLS > 0
-                auto ol_dummy_str_s = random_a_string(72, 72);
-                std::string s1(ol_dummy_str_s);
-                olv.ol_dummy_str1 = db.encode(wid-1, s1);
-                ol_dummy_str_s = random_a_string(72, 72);
-                std::string s2(ol_dummy_str_s);
-                olv.ol_dummy_str2 = db.encode(wid-1, s2);
-                ol_dummy_str_s = random_a_string(72, 72);
-                std::string s3(ol_dummy_str_s);
-                olv.ol_dummy_str3 = db.encode(wid-1, s3);
-                ol_dummy_str_s = random_a_string(72, 72);
-                std::string s4(ol_dummy_str_s);
-                olv.ol_dummy_str4 = db.encode(wid-1, s4);
-                #endif
-                #if LARGE_DUMMY_COLS == 2
-                ol_dummy_str_s = random_a_string(72, 72);
-                std::string s5(ol_dummy_str_s);
-                olv.ol_dummy_str5 = db.encode(wid-1, s5);
-                ol_dummy_str_s = random_a_string(72, 72);
-                std::string s6(ol_dummy_str_s);
-                olv.ol_dummy_str6 = db.encode(wid-1, s6);
-                ol_dummy_str_s = random_a_string(72, 72);
-                std::string s7(ol_dummy_str_s);
-                olv.ol_dummy_str7 = db.encode(wid-1, s7);
-                ol_dummy_str_s = random_a_string(72, 72);
-                std::string s8(ol_dummy_str_s);
-                olv.ol_dummy_str8 = db.encode(wid-1, s8);
-                #endif
-
                 #else
                 olv.ol_dist_info = random_a_string(24, 24);
-                #if LARGE_DUMMY_COLS > 0
-                olv.ol_dummy_str1 = random_a_string(72, 72);
-                olv.ol_dummy_str2 = random_a_string(72, 72);
-                olv.ol_dummy_str3 = random_a_string(72, 72);
-                olv.ol_dummy_str4 = random_a_string(72, 72);
-                #endif
-                #if LARGE_DUMMY_COLS == 2
-                olv.ol_dummy_str5 = random_a_string(72, 72);
-                olv.ol_dummy_str6 = random_a_string(72, 72);
-                olv.ol_dummy_str7 = random_a_string(72, 72);
-                olv.ol_dummy_str8 = random_a_string(72, 72);
-                #endif
                 #endif
             #if 0 // no need for secondary index in orderlines for Q.4!
                 auto val_p = db.tbl_orderlines(wid).nontrans_put(olk, olv);
