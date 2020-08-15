@@ -167,30 +167,7 @@ template <typename DBParams>
 class tpch_runner {
 public:
     // the database will be either hybrid_db (single_node == true), or tpch_db (false).
-    tpch_runner(int id, tpcc::tpcc_input_generator& ig, void* database): db(database), runner_id(id), ig(ig) {
-        
-
-        // generate a random string to compare the string columns and evaluate the dictionary compression
-        size_t len = 24;
-        str1_to_cmp.reserve(len);
-        srand(time(NULL));
-        for (auto i = 0u; i < len; ++i) {
-            auto n = rand() % 62;
-            char c = (n < 26) ? char('a' + n) :
-                    ((n < 52) ? char('A' + (n - 26)) : char('0' + (n - 52)));
-            str1_to_cmp.push_back(c);
-        }
-        std::string str2_to_cmp;
-        size_t len2= 72;
-        str2_to_cmp.reserve(len2);
-        srand(time(NULL));
-        for (auto i = 0u; i < len2; ++i) {
-            auto n = rand() % 62;
-            char c = (n < 26) ? char('a' + n) :
-                    ((n < 52) ? char('A' + (n - 26)) : char('0' + (n - 52)));
-            str2_to_cmp.push_back(c);
-        }
-    }
+    tpch_runner(int id, tpcc::tpcc_input_generator& ig, void* database): db(database), runner_id(id), ig(ig) { }
 
     // finds the next query to be run for this thread (round-robin) and runs it
     void run_next_query();
@@ -198,8 +175,6 @@ public:
     void run_query4();
 
 private:
-    std::string str1_to_cmp;
-    std::string str2_to_cmp;
     void* db;
     int runner_id;
     tpcc::tpcc_input_generator &ig;
