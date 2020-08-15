@@ -97,7 +97,7 @@ struct warehouse_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() {
+    const char* to_str() {
         return "";
     }
     uint64_t w_id;
@@ -150,7 +150,7 @@ struct warehouse_value {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() {
+    const char* to_str() {
         return "";
     }
 };
@@ -172,7 +172,7 @@ struct district_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() {
+    const char* to_str() {
         return "";
     }
     uint64_t d_w_id;
@@ -230,7 +230,7 @@ struct district_value {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() {
+    const char* to_str() {
         return "";
     }
 };
@@ -268,7 +268,7 @@ struct customer_idx_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() {
+    const char* to_str() {
         return "";
     }
     uint64_t c_w_id;
@@ -288,7 +288,7 @@ struct customer_idx_value {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() {
+    const char* to_str() {
         return "";
     }
 };
@@ -313,7 +313,7 @@ struct customer_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() {
+    const char* to_str() {
         return "";
     }
     uint64_t get_c_id() const {
@@ -416,7 +416,12 @@ struct customer_value {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() {
+    customer_value(){}
+    customer_value(const lcdf::Str& mt_val) {
+        assert(mt_val.length() == sizeof(*this));
+        memcpy(this, mt_val.data(), sizeof(*this));
+    }
+    const char* to_str() {
         return "";
     }
 };
@@ -469,7 +474,7 @@ struct history_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() {
+    const char* to_str() {
         return "";
     }
     uint32_t w_id;
@@ -502,7 +507,7 @@ struct history_value {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() {
+    const char* to_str() {
         return "";
     }
 };
@@ -532,7 +537,7 @@ struct order_cidx_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() {
+    const char* to_str() {
         return "";
     }
     uint64_t o_w_id;
@@ -540,7 +545,42 @@ struct order_cidx_key {
     uint64_t o_c_id;
     uint64_t o_id;
 };
-
+// required for LOG_RECS == 2 so that to store numbers in reverse order (and be able to parse them easier on log replay!)
+static void store_reverse_num(char* buf, uint32_t& pos, uint64_t num, bool last){
+    uint64_t res=0;
+    uint64_t div=1;
+    uint32_t ndigits=1;
+    uint32_t trailing_zeros=0, chars=0;
+    while(num/div > 9){
+        ndigits++;
+        div*=10;
+    }
+    div=1;
+    bool trailing = true;
+    if(num==0){
+        sprintf(buf+pos, "%lu%s", (uint64_t)0, (last ? "/": ","));
+        pos +=2;
+        return;
+    }
+    while(ndigits>0){
+        if ((num/div) % 10 == 0 && trailing){
+            trailing_zeros++;
+        }
+        else {
+            trailing = false;
+            chars++;
+        }
+        res += ((num/div) % 10) * pow(10, ndigits-1);
+        div *= 10;
+        ndigits--;
+    }
+        
+    for(uint32_t i=0; i<trailing_zeros; i++){
+        buf[pos++] = '0'; // ASCII code for zero
+    }
+    sprintf(buf+pos, "%lu%s", res, (last? "/": ",")); // this will store the ASCII representation of the given number
+    pos += chars+1;
+}
 struct order_key {
 #if CONTENTION_AWARE_IDX
     typedef uint64_t wdid_type;
@@ -559,6 +599,44 @@ struct order_key {
         assert(mt_key.length() == sizeof(*this));
         memcpy(this, mt_key.data(), sizeof(*this));
     }
+    // construct key from buffer in the case of LOG_RECS == 3
+    order_key(const char* buf){
+        uint32_t pos=0;
+        uint32_t parts_found=0;
+        while(buf[pos] != '/'){
+            uint64_t num = 0;
+            int i=1;
+            while(buf[pos] != ',' && buf[pos] != '/'){
+                #if LOG_RECS == 2
+                num+= (buf[pos] - 48)*i; // LOG_RECS 2 stores ASCII representation of numbers
+                #elif LOG_RECS == 3
+                num+= buf[pos]*i;
+                #endif
+                i*=10;
+                pos++;
+            }
+            switch (parts_found){
+                case 0:
+                    o_w_id = bswap(num);
+                    break;
+                case 1:
+                    o_d_id = bswap(num);
+                    break;
+                case 2:
+                    o_id = bswap(num);
+                    break;
+                default:
+                    std::cout<<"Error while constructing key from buf: "<< buf<<std::endl;
+            }
+            parts_found++;
+            if(buf[pos] != '/') // if we reach '/', we're done with that key/val
+                pos++;
+        }
+        if(parts_found != 3){
+            std::cout<<"Error with key " << buf <<". parts found: "<< parts_found<<std::endl;
+        }
+        assert(parts_found == 3);
+    }
     bool operator==(const order_key& other) const {
         return (o_w_id == other.o_w_id) && (o_d_id == other.o_d_id) && (o_id == other.o_id);
     }
@@ -568,9 +646,15 @@ struct order_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() const { // used by the log to compress and only store the actual length, rather than the entire size of the struct!
-        std::string s = std::to_string(bswap(o_w_id)) + "," + std::to_string(bswap(o_d_id)) + "," + std::to_string(bswap(o_id));
-        return lcdf::Str(s.c_str());
+    char* to_str() const { // used by the log to compress and only store the actual length, rather than the entire size of the struct!
+        char * t = new char[64];
+        memset(t, 0, 64);
+        //std::string s = std::to_string(bswap(o_w_id)) + "," + std::to_string(bswap(o_d_id)) + "," + std::to_string(bswap(o_id));
+        uint32_t pos=0;
+        store_reverse_num(t, pos, bswap(o_w_id), false);
+        store_reverse_num(t, pos, bswap(o_d_id), false);
+        store_reverse_num(t, pos, bswap(o_id), true);
+        return t;
     }
 
     wdid_type o_w_id;
@@ -609,18 +693,76 @@ struct order_value{
     uint32_t o_entry_d;
     uint32_t o_ol_cnt;
     uint32_t o_all_local;
+
+    order_value(){}    
+    order_value(const lcdf::Str& mt_val) {
+        assert(mt_val.length() == sizeof(*this));
+        memcpy(this, mt_val.data(), sizeof(*this));
+    }
+    // construct key from buffer in the case of LOG_RECS == 3
+    order_value(const char* buf){
+        uint32_t pos=0;
+        uint32_t parts_found=0;
+        while(buf[pos] != '/'){
+            uint64_t num = 0;
+            int i=1;
+            while(buf[pos] != ',' && buf[pos] != '/'){
+                #if LOG_RECS == 2
+                num+= (buf[pos] - 48)*i; // LOG_RECS 2 stores ASCII representation of numbers
+                #elif LOG_RECS == 3
+                num+= buf[pos]*i;
+                #endif
+                i*=10;
+                pos++;
+            }
+            switch (parts_found){
+                case 0:
+                    o_c_id = num;
+                    break;
+                case 1:
+                    o_carrier_id = num;
+                    break;
+                case 2:
+                    o_entry_d = num;
+                    break;
+                case 3:
+                    o_ol_cnt = num;
+                    break;
+                case 4:
+                    o_all_local = num;
+                    break;                
+                default:
+                    std::cout<<"Error while constructing value from buf: "<< buf<<std::endl;
+            }
+            parts_found++;
+            if(buf[pos] != '/') // if we reach '/', we're done with that key/val
+                pos++;
+        }
+        assert(parts_found == 5);
+    }
     // Dimos: add Str() in order to add the value in the log
     operator lcdf::Str() const {
-        return lcdf::Str((const char *)this, sizeof(*this));
+        return lcdf::Str((const char *)this, sizeof(*this)); // Dimos - WARNING: the size of order_value is actually 28 bytes but sizeof(order_value) is 32! This means the memcmp will compare more bytes at the end and it might say the values are not equal!! (Str operator == uses memcmp)
+    } // the actual size stored for the struct is actually 32, so the memcmp should work fine!
+    bool operator==(const order_value& other) const{
+        return memcmp(this, &other, sizeof(*this)) ==0; // Dimos - WARNING: the size of order_value is actually 28 bytes but sizeof(order_value) is 32! This means the memcmp will compare more bytes at the end and it might say the values are not equal!! (Str operator == uses memcmp)
     }
-    lcdf::Str to_str() const { // used by the log to compress and only store the actual length, rather than the entire size of the struct!
-        std::string s = std::to_string(o_c_id) + "," +  std::to_string(o_carrier_id) + "," + std::to_string(o_entry_d) + "," + std::to_string(o_ol_cnt) + "," + std::to_string(o_all_local);
-        return lcdf::Str(s.c_str());
+    char* to_str() const { // used by the log to compress and only store the actual length, rather than the entire size of the struct!
+        char * t = new char[64];
+        uint32_t pos=0;
+        memset(t, 0, 64);
+        //std::string s = std::to_string(o_c_id) + "," +  std::to_string(o_carrier_id) + "," + std::to_string(o_entry_d) + "," + std::to_string(o_ol_cnt) + "," + std::to_string(o_all_local);
+        store_reverse_num(t, pos, o_c_id, false);
+        store_reverse_num(t, pos, o_carrier_id, false);
+        store_reverse_num(t, pos, o_entry_d, false);
+        store_reverse_num(t, pos, o_ol_cnt, false);
+        store_reverse_num(t, pos, o_all_local, true);
+        //sprintf(t, "%lu,%lu,%u,%u,%u/", o_c_id, o_carrier_id, o_entry_d, o_ol_cnt, o_all_local);
+        return t;
     }
 };
 #endif
 
-#if RUN_TPCH
 struct order_sec_key {
 #if CONTENTION_AWARE_IDX
     typedef uint64_t wdid_type;
@@ -668,7 +810,7 @@ struct order_sec_value {
         return lcdf::Str((const char*)this, sizeof(*this));
     }
 };
-/*
+
 struct orderline_sec_key {
     orderline_sec_key(uint64_t deliv_d, uint64_t w, uint64_t d, uint64_t id, uint64_t n){
         ol_delivery_d = bswap(deliv_d);
@@ -706,9 +848,7 @@ struct orderline_sec_value {
         return lcdf::Str((const char*)this, sizeof(*this));
     }
 };
-*/
 
-#endif
 
 // ORDER-LINE
 
@@ -724,6 +864,44 @@ struct orderline_key {
         assert(mt_key.length() == sizeof(*this));
         memcpy(this, mt_key.data(), sizeof(*this));
     }
+    // construct key from buffer in the case of LOG_RECS == 2,3
+    orderline_key(const char* buf){
+        uint32_t pos=0;
+        uint32_t parts_found=0;
+        while(buf[pos] != '/'){
+            uint64_t num = 0;
+            int i=1;
+            while(buf[pos] != ',' && buf[pos] != '/'){
+                #if LOG_RECS == 2
+                num+= (buf[pos] - 48)*i; // LOG_RECS 2 stores ASCII representation of numbers
+                #elif LOG_RECS == 3
+                num+= buf[pos]*i;
+                #endif
+                i*=10;
+                pos++;
+            }
+            switch (parts_found){
+                case 0:
+                    ol_w_id = bswap(num);
+                    break;
+                case 1:
+                    ol_d_id = bswap(num);
+                    break;
+                case 2:
+                    ol_o_id = bswap(num);
+                    break;
+                case 3:
+                    ol_number = bswap(num);
+                    break;
+                default:
+                    std::cout<<"Error while constructing orderline key from buf: "<< buf<<std::endl;
+            }
+            parts_found++;
+            if(buf[pos] != '/') // if we reach '/', we're done with that key/val
+                pos++;
+        }
+        assert(parts_found == 4);
+    }
     bool operator==(const orderline_key& other) const {
         return (ol_w_id == other.ol_w_id) && (ol_d_id == other.ol_d_id) &&
             (ol_o_id == other.ol_o_id) && (ol_number == other.ol_number);
@@ -734,9 +912,17 @@ struct orderline_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() const {
-        std::string s = std::to_string(bswap(ol_w_id)) + "," + std::to_string(bswap(ol_d_id)) + "," + std::to_string(bswap(ol_o_id)) + "," + std::to_string(bswap(ol_number));
-        return lcdf::Str(s.c_str());
+    char* to_str() const {
+        char * t = new char[64];
+        uint32_t pos=0;
+        memset(t, 0, 64);
+        //std::string s = std::to_string(bswap(ol_w_id)) + "," + std::to_string(bswap(ol_d_id)) + "," + std::to_string(bswap(ol_o_id)) + "," + std::to_string(bswap(ol_number));
+        store_reverse_num(t, pos, bswap(ol_w_id), false);
+        store_reverse_num(t, pos, bswap(ol_d_id), false);
+        store_reverse_num(t, pos, bswap(ol_o_id), false);
+        store_reverse_num(t, pos, bswap(ol_number), true);
+        //sprintf(t, "%lu,%lu,%lu,%lu/", bswap(ol_w_id), bswap(ol_d_id), bswap(ol_o_id), bswap(ol_number));
+        return t;
     }
 
     uint64_t ol_w_id;
@@ -772,22 +958,132 @@ struct orderline_value {
                                    ol_delivery_d,
                                    ol_quantity,
                                    ol_amount,
-                                   ol_dist_info };
+                                   ol_dist_info 
+                                   #if LARGE_DUMMY_COLS > 0
+                                   , ol_dummy_str1, ol_dummy_str2,
+                                   ol_dummy_str3, ol_dummy_str4
+                                   #endif
+                                   #if LARGE_DUMMY_COLS == 2
+                                   , ol_dummy_str5, ol_dummy_str6,
+                                   ol_dummy_str7, ol_dummy_str8
+                                   #endif
+                                   };
 
     uint64_t       ol_i_id;
     uint64_t       ol_supply_w_id;
     uint32_t       ol_delivery_d;
     uint32_t       ol_quantity;
     int32_t        ol_amount;
+    #if DICTIONARY == 1 || DICTIONARY == 2
+    uint32_t        ol_dist_info;
+    #if LARGE_DUMMY_COLS > 0
+    uint32_t        ol_dummy_str1;
+    uint32_t        ol_dummy_str2;
+    uint32_t        ol_dummy_str3;
+    uint32_t        ol_dummy_str4;
+    #endif
+    #if LARGE_DUMMY_COLS == 2
+    uint32_t        ol_dummy_str5;
+    uint32_t        ol_dummy_str6;
+    uint32_t        ol_dummy_str7;
+    uint32_t        ol_dummy_str8;
+    #endif    
+    #else
     fix_string<24> ol_dist_info;
+    #if LARGE_DUMMY_COLS > 0
+    fix_string<72> ol_dummy_str1;
+    fix_string<72> ol_dummy_str2;
+    fix_string<72> ol_dummy_str3;
+    fix_string<72> ol_dummy_str4;
+    #endif
+    #if LARGE_DUMMY_COLS == 2
+    fix_string<72> ol_dummy_str5;
+    fix_string<72> ol_dummy_str6;
+    fix_string<72> ol_dummy_str7;
+    fix_string<72> ol_dummy_str8;
+    #endif
+    #endif
+
+    orderline_value(){}
+    orderline_value(const lcdf::Str& mt_val) {
+        assert(mt_val.length() == sizeof(*this));
+        memcpy(this, mt_val.data(), sizeof(*this));
+    }
+    orderline_value(const char* buf){
+        uint32_t pos=0;
+        uint32_t parts_found=0;
+        while(buf[pos] != '/'){
+            uint64_t num = 0;
+            int i=1;
+            while(buf[pos] != ',' && buf[pos] != '/'){
+                if(parts_found == 5)
+                    break;
+                #if LOG_RECS == 2
+                num+= (buf[pos] - 48)*i; // LOG_RECS 2 stores ASCII representation of numbers
+                #elif LOG_RECS == 3
+                num+= buf[pos]*i;
+                #endif
+                i*=10;
+                pos++;
+            }
+            switch (parts_found){
+                case 0:
+                    ol_i_id = num;
+                    break;
+                case 1:
+                    ol_supply_w_id = num;
+                    break;
+                case 2:
+                    ol_delivery_d = num;
+                    break;
+                case 3:
+                    ol_quantity = num;
+                    break;
+                case 4:
+                    ol_amount = num;
+                    break;
+                case 5:
+                    #if DICTIONARY == 1 || DICTIONARY == 2
+                    always_assert(false, "Not implemented for dictionary!\n");
+                    #else
+                    ol_dist_info = fix_string<24>(buf +pos);
+                    pos+=24;
+                    #endif
+                    break;
+                default:
+                    std::cout<<"Error while constructing orderline key from buf: "<< buf <<" . pos: "<<pos<<std::endl;
+            }
+            parts_found++;
+            if(buf[pos] != '/') // if we reach '/', we're done with that key/val
+                pos++;
+        }
+        assert(parts_found == 6);
+    }
     // Dimos: add Str() in order to add the value in the log
     operator lcdf::Str() const {
-        return lcdf::Str((const char *)this, sizeof(*this));
+        return lcdf::Str((const char *)this, sizeof(*this)); // Dimos - WARNING: the size of order_value is actually 52 bytes but sizeof(order_value) is 56! This means the memcmp will compare more bytes at the end and it might say the values are not equal!! (Str operator == uses memcmp)
     }
-    lcdf::Str to_str() {
-        std::string s = std::to_string(ol_i_id) + "," + std::to_string(ol_supply_w_id) + "," + std::to_string(ol_delivery_d) + "," + std::to_string(ol_quantity) +
-         "," + std::to_string(ol_amount) + "," + std::string(ol_dist_info);
-        return lcdf::Str(s.c_str());
+    bool operator==(const orderline_value& other) const {
+        return memcmp(this, &other, sizeof(*this)) == 0; // Dimos - WARNING: the size of order_value is actually 52 bytes but sizeof(order_value) is 56! This means the memcmp will compare more bytes at the end and it might say the values are not equal!! (Str operator == uses memcmp)
+    }
+    char* to_str() {
+        char * t  = new char[64];
+        uint32_t pos = 0;
+        memset(t, 0, 64);
+        store_reverse_num(t, pos, ol_i_id, false);
+        store_reverse_num(t, pos, ol_supply_w_id, false);
+        store_reverse_num(t, pos, ol_delivery_d, false);
+        store_reverse_num(t, pos, ol_quantity, false);
+        store_reverse_num(t, pos, ol_amount, false);
+        #if DICTIONARY == 1 || DICTIONARY == 2
+        always_assert(false, "Not implemented for dictionary!\n");
+        #else
+        sprintf(t+pos, "%s/", std::string(ol_dist_info).c_str());
+        #endif
+        //std::string s = std::to_string(ol_i_id) + "," + std::to_string(ol_supply_w_id) + "," + std::to_string(ol_delivery_d) + "," + std::to_string(ol_quantity) +
+        //"," + std::to_string(ol_amount) + "," + std::string(ol_dist_info);
+        //sprintf(t, "%lu,%lu,%u,%u,%d,%s/", ol_i_id, ol_supply_w_id, ol_delivery_d, ol_quantity, ol_amount, std::string(ol_dist_info).c_str());
+        return t;
     }
 };
 #endif
@@ -823,7 +1119,7 @@ struct item_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() {
+    const char* to_str() {
         return "";
     }
     uint64_t i_id;
@@ -843,7 +1139,7 @@ struct item_value {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() {
+    const char* to_str() {
         return "";
     }
 };
@@ -869,7 +1165,7 @@ struct stock_key {
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() {
+    const char* to_str() {
         return "";
     }
     uint64_t s_w_id;
@@ -909,13 +1205,17 @@ struct stock_value {
     uint32_t       s_ytd;
     uint32_t       s_order_cnt;
     uint32_t       s_remote_cnt;
+    #if DICTIONARY == 1 || DICTIONARY == 2
+    uint32_t s_dists[NUM_DISTRICTS_PER_WAREHOUSE];
+    #else
     fix_string<24> s_dists[NUM_DISTRICTS_PER_WAREHOUSE];
+    #endif
     var_string<50> s_data;
     // Dimos: add Str() in order to add the value in the log
     operator lcdf::Str() const {
         return lcdf::Str((const char *)this, sizeof(*this));
     }
-    lcdf::Str to_str() {
+    const char* to_str() {
         return "";
     }
 };
