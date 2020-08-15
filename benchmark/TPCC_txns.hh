@@ -349,35 +349,6 @@ void tpcc_runner<DBParams>::run_txn_neworder() {
         #else
         */
         olv->ol_dist_info = s_dist;
-        #if DICTIONARY == 1
-        #if LARGE_DUMMY_COLS > 0
-        olv->ol_dummy_str1 = s_dist;
-        olv->ol_dummy_str2 = s_dist;
-        olv->ol_dummy_str3 = s_dist;
-        olv->ol_dummy_str4 = s_dist;
-        #endif
-        #if LARGE_DUMMY_COLS == 2
-        olv->ol_dummy_str5 = s_dist;
-        olv->ol_dummy_str6 = s_dist;
-        olv->ol_dummy_str7 = s_dist;
-        olv->ol_dummy_str8 = s_dist;
-        #endif
-        #else
-        #if LARGE_DUMMY_COLS > 0
-        olv->ol_dummy_str1.set_3_times(s_dist);
-        olv->ol_dummy_str2.set_3_times(s_dist);
-        olv->ol_dummy_str3.set_3_times(s_dist);
-        olv->ol_dummy_str4.set_3_times(s_dist);
-        #endif
-        #if LARGE_DUMMY_COLS == 2
-        olv->ol_dummy_str5.set_3_times(s_dist);
-        olv->ol_dummy_str6.set_3_times(s_dist);
-        olv->ol_dummy_str7.set_3_times(s_dist);
-        olv->ol_dummy_str8.set_3_times(s_dist);
-        #endif
-        #endif
-
-
     #if 0
         // get the pointer of the internal_elem that stores the given key!
         uint64_t* el;
