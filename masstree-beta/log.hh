@@ -22,22 +22,41 @@
 #include <pthread.h>
 #include "misc.hh"
 
+#include <time.h> 
+
+
+
 #include <unordered_map>
 
 #include "../benchmark/DB_params.hh"
 
-#define MEASURE_LOG_RECORDS 0
+#define MEASURE_LOG_RECORDS 1
+#define MEASURE_MAP_SZ 1
 
 #ifndef LOG_NTABLES // should be defined in TPCC_bench.hh
 #define LOG_NTABLES 0
 #endif
+#ifndef LOG_RECS // should be defined in TPCC_bench.hh
+#define LOG_RECS 0
+#endif
+#ifndef LOGREC_OVERWRITE // should be defined in TPCC_bench.hh
+#define LOGREC_OVERWRITE 0
+#endif
+
+#ifndef LOG_DRAIN_REQUEST // should be defined in TPCC_bench.hh
+#define LOG_DRAIN_REQUEST 0
+#endif
+
+#ifndef NLOGGERS // should be defined in TPCC_bench.hh
+#define NLOGGERS 10
+#endif
 
 // 1 for std::unordered_map
 // 2 for STO Uindex (non-transactional)
-#define MAP 1
-#define STD_MAP (MAP == 1 || LOG_NTABLES == 0) // if LOG_NTABLES is not set, then use default std::unordered_map since STO UIndex is not defined! (That's when we include log.hh from different files)
-#define STO_MAP (MAP == 2 && LOG_NTABLES > 0)
-
+#define MAP 2
+//#define STD_MAP (MAP == 1 || LOG_NTABLES == 0) // if LOG_NTABLES is not set, then use default std::unordered_map since STO UIndex is not defined! (That's when we include log.hh from different files)
+//#define STO_MAP (MAP == 2 && LOG_NTABLES > 0)
+#define STD_MAP 1
 
 class logset;
 
@@ -72,6 +91,8 @@ class loginfo {
     void record(int command, const query_times& qt, Str key, Str value);
     void record(int command, const query_times& qt, Str key,
                 const lcdf::Json* req, const lcdf::Json* end_req);
+    // pass the table ID as a parameter, so that to know for which table this record is
+    void record(int command, const query_times& qt, Str key, Str value, char tbl);
 
     uint32_t current_size(){
         return pos_;
@@ -154,7 +175,8 @@ class loginfo {
     friend class logset;
 };
 
-struct logrec {
+// the log record stored in the map
+struct logmap_rec {
     enum class NamedColumn : int { 
         cmd = 0, val, epoch, ts, next
     };
@@ -162,22 +184,22 @@ struct logrec {
     Str val;
     kvepoch_t epoch;
     kvtimestamp_t ts;
-    logrec* next;
+    logmap_rec* next;
 
-    logrec() : command(0), val(""), epoch(0), ts(0), next(0) {}
-    logrec(uint32_t cmd, Str v, kvepoch_t e, kvtimestamp_t t, logrec* n): command(cmd), val(v), epoch(e), ts(t), next(n) {}
+    logmap_rec() : command(0), val(""), epoch(0), ts(0), next(0) {}
+    logmap_rec(uint32_t cmd, Str v, kvepoch_t e, kvtimestamp_t t, logmap_rec* n): command(cmd), val(v), epoch(e), ts(t), next(n) {}
 };
+
+#if STD_MAP
+typedef std::unordered_map<Str, logmap_rec> logmap_t;
+#elif STO_MAP
+typedef bench::unordered_index<Str, logmap_rec, db_params::db_default_params> logmap_t;
+#endif
 
 template <int N_TBLS=1>
 class loginfo_map {
   public:
-    // logging
-    /*struct query_times {
-        kvepoch_t epoch;
-        kvtimestamp_t ts;
-        kvtimestamp_t prev_ts;
-    };*/
-
+    
     struct logset_info {
         int32_t size_;
         int allocation_offset_;
@@ -190,28 +212,35 @@ class loginfo_map {
 
     uint32_t current_size(int tbl){
         (void)tbl;
+    #if MEASURE_MAP_SZ
+        return size[tbl];
+    #else
         return 0;
+    #endif
     }
 
     uint32_t cur_log_records(int tbl){
         #if STD_MAP
         return map[tbl].size();
         #elif STO_MAP
-        return map[tbl].nbuckets();
+        return map[tbl].nbuckets(); // this will return the initial size of the map and not the actual contents (initialized with .resize())
         #endif
     }
 
-    private:
+    logmap_t& get_map(int tbl){
+        return map[tbl];
+    }
 
-    #if STD_MAP
-    typedef std::unordered_map<Str, logrec> logmap_t;
-    #elif STO_MAP
-    typedef bench::unordered_index<Str, logrec, db_params::db_default_params> logmap_t;
-    #endif
+    private:
     
     logmap_t map [N_TBLS]; // N_TBLS * 56
-
+    #if MEASURE_MAP_SZ
+    unsigned size[N_TBLS];
+    char cache_line_2_ [ ((N_TBLS * sizeof(logmap_t) + N_TBLS * sizeof(unsigned) + 2*sizeof(threadinfo*) )  % CACHE_LINE_SIZE  > 0? (CACHE_LINE_SIZE -  (N_TBLS * sizeof(logmap_t) + (N_TBLS * sizeof(unsigned)) + 2*sizeof(threadinfo*) )  % CACHE_LINE_SIZE) : 0) ];
+    #else
     char cache_line_2_ [ ((N_TBLS * sizeof(logmap_t) + 2*sizeof(threadinfo*) )  % CACHE_LINE_SIZE  > 0? (CACHE_LINE_SIZE -  (N_TBLS * sizeof(logmap_t) + 2*sizeof(threadinfo*) )  % CACHE_LINE_SIZE) : 0) ];
+    #endif
+
 
     union { // 32 bytes
         struct { // 12 bytes
@@ -255,22 +284,68 @@ class loginfo_tbl {
     };
     // NB may block!
     // tbl: The table where the log record belongs
-    void record(int command, const loginfo::query_times& qt, Str key, Str value, int tbl);
+    // return the position of the log record we just added! Then we will store it in the internal_elem of Masstree and be able to find it easily if there is an update on the same key!
+    uint32_t record(int command, const loginfo::query_times& qt, Str key, Str value, int tbl, int pos=-1);
     void record(int command, const loginfo::query_times& qt, Str key,
                 const lcdf::Json* req, const lcdf::Json* end_req);
 
-    void record(int command, const loginfo::query_times& qtimes, void* keyp, uint32_t keylen, void* valp, uint32_t vallen, int tbl);
+    void record(int command, const loginfo::query_times& qtimes, const void* keyp, uint32_t keylen, const void* valp, uint32_t vallen, int tbl);
+
+    void record_new_epoch(int tbl, kvepoch_t new_epoch);
 
     uint32_t current_size(uint32_t tbl){
         return pos_[tbl] - start_[tbl];
     }
 
+    void reset_all(){
+        for (uint32_t i=0; i<N_TBLS; i++){
+            pos_[i]=start_[i];
+        }
+        log_epoch_ = 1; // reset log epoch
+    }
+
+    #if MEASURE_LOG_RECORDS
+    uint32_t cur_log_records(){
+        return records_num_;
+    }
+
+    void incr_cur_log_records(){
+        records_num_++;
+    }
+    #else
     uint32_t cur_log_records(){
         return 0;
     }
+    #endif
 
     char* get_buf(uint32_t tbl){ // we need the pointer to the buffer of the given table. This will be used for log replay (since this log is not intended to be flushed to disk)
         return buf_  + start_[tbl];
+    }
+
+    int get_log_index(){
+        return logindex_;
+    }
+
+    inline kvepoch_t get_local_epoch(){
+        return log_epoch_;
+    }
+
+    inline void wait_to_logdrain(){
+        //struct timespec abstime;
+        //abstime.tv_sec = 0;
+        //abstime.tv_nsec = 10000; // 10us
+        assert(pthread_mutex_lock(&mutex) == 0);
+        //int r = pthread_cond_timedwait(&logdrain_start_cond, &mutex, &abstime);
+        //assert(r == 0 || r == ETIMEDOUT);
+        int r = pthread_cond_wait(&logdrain_start_cond, &mutex);
+        assert(r==0);
+        assert(pthread_mutex_unlock(&mutex) == 0);
+    }
+
+    inline void signal_to_logdrain(){
+        assert(pthread_mutex_lock(&mutex) == 0);
+        assert(pthread_cond_signal(&logdrain_start_cond)==0);
+        assert(pthread_mutex_unlock(&mutex) == 0);
     }
 
     private:
@@ -285,26 +360,35 @@ class loginfo_tbl {
     struct logset_info {
         int32_t size_;
         int allocation_offset_;
+        //#if LOG_DRAIN_REQUEST
+        //bool request_log_drain = false; // set by a log drainer thread and checked by the log writer
+        //#endif
     };
     
     front f_;
+
+   
     
     #if MEASURE_LOG_RECORDS
     uint32_t records_num_; // Dimos - number of log records currently stored
-    char padding1_[CACHE_LINE_SIZE - sizeof(front) - 4* sizeof(kvepoch_t) - sizeof(uint32_t)]; // subtract the size of records_num_ also!
+    char padding1_[CACHE_LINE_SIZE - sizeof(front) - 1* sizeof(kvepoch_t) - sizeof(uint32_t)]; // subtract the size of records_num_ also!
     #else
     // we don't need quiescent, wake, flushed for in-memory log
     char padding1_[CACHE_LINE_SIZE - sizeof(front) - 1* sizeof(kvepoch_t)]; // we can fit all these in one cache line.
     #endif
 
-    kvepoch_t log_epoch_;       // epoch written to log (non-quiescent)
+    kvepoch_t log_epoch_=1;       // epoch written to log (non-quiescent)
     // TODO: might not needed since we don't flush this log to disk!
     //kvepoch_t quiescent_epoch_; // epoch we went quiescent
     //kvepoch_t wake_epoch_;      // epoch for which we recorded a wake command
     //kvepoch_t flushed_epoch_;   // epoch fsync()ed to disk
 
 
-    
+    pthread_mutex_t mutex; // 40 bytes
+    pthread_cond_t logdrain_start_cond; //48 bytes
+
+    char cache_line_cond [2 * CACHE_LINE_SIZE - sizeof(pthread_mutex_t) - sizeof(pthread_cond_t)];
+
     union { // 20 + 12 * N_TBLS bytes
         struct { // 20 + 12 * N_TBLS bytes
             char *buf_;
@@ -333,7 +417,6 @@ class loginfo_tbl {
 
 
 class logset_base {
-
 };
 
 
@@ -347,6 +430,11 @@ class logset_tbl : public logset_base {
     inline int size() const;
     inline loginfo_tbl<N_TBLS>& log(int i);
     inline const loginfo_tbl<N_TBLS>& log(int i) const;
+
+    #if LOG_DRAIN_REQUEST
+    //inline bool has_logdrain_request();
+    //inline void set_logdrain_request(bool req);
+    #endif
 
   private:
     loginfo_tbl<N_TBLS> li_[0];
@@ -392,35 +480,76 @@ enum logcommand {
     logcmd_remove = 0x4D45526B,         // "kREM"
     logcmd_epoch = 0x4F50456B,          // "kEPO"
     logcmd_quiesce = 0x4955516B,        // "kQUI"
-    logcmd_wake = 0x4B41576B            // "kWAK"
+    logcmd_wake = 0x4B41576B,            // "kWAK"
+    logcmd_wraparound = 0x4152576B              // "kWRA"
 };
 
 
 // replay the in-memory log.
 // buf:         the pointer in the log buffer from where to start replaying (it could be any location within the buffer)
-// size:        the size of the log to be played, starting from buf.
 // to_epoch:    the epoch until which it should replay. When reaches an epoch greater than to_epoch, it will stop and store the location in buf.
 class logmem_replay {
     public:
-    logmem_replay(char * buf, off_t size) : size_(size), buf_(buf) {}
+    logmem_replay(char * buf) : buf_(buf) {
+        info.next_epoch = 0;
+    }
     ~logmem_replay(){}
 
     struct info_type {
-        kvepoch_t to_epoch;
-        std::unordered_map<uint64_t, char*> epoch_ptr; // we need to know where each epoch starts in the buffer. That way, we don't have to traverse the entire buffer to learn about the epoch's location, but 
+        kvepoch_t next_epoch; // the epoch after the one we applied
+        std::unordered_map<uint64_t, const char*> epoch_ptr; // we need to know where each epoch starts in the buffer. That way, we don't have to traverse the entire buffer to learn about the epoch's location, but 
         // rather learn them as we go. We need to store where each epoch starts so that next time to be able to start from that location in the buffer, rather than the beginning.
     };
 
-    info_type info() const;
-    // to_epoch: until which epoch to play the log. As soon as we encounter a log epoch greater than to_epoch, we mark the location in the buffer in epoch_ptr and return
+    info_type get_info() const;
+    // to_epoch:    until which epoch to play the log. As soon as we encounter a log epoch to_epoch, we mark the location in the buffer in epoch_ptr, store that epoch in next_epoch and return
+    // tbl:         the table that we want to replay: if used a per table log, -1 otherwise
+    // size:        the size of the log to be played, starting from buf.
     template <typename Callback>
-    uint64_t replay(kvepoch_t to_epoch, Callback callback);
+    uint64_t replay(kvepoch_t to_epoch, off_t size, Callback callback, int tbl);
 
   private:
-    off_t size_;
     char *buf_;
+    info_type info;
 
 };
+
+class logmap_replay {
+
+    public:
+    logmap_replay(logmap_t& m): map(m){}
+
+    template <typename Callback>
+    uint64_t replay(kvepoch_t to_epoch, Callback callback, int tbl);
+
+    private:
+    kvepoch_t to_epoch;
+    logmap_t & map;
+
+};
+
+
+template <typename Callback>
+uint64_t logmap_replay::replay(kvepoch_t to_epoch, Callback callback, int tbl){
+    uint64_t recs_replayed=0;
+    #if STD_MAP
+    for(auto & elem : map){
+        if(to_epoch.value() == 0 || elem.second.epoch.value() <= to_epoch.value()){ // only process log records with epoch within the given epoch
+            callback(elem.first, elem.second.val, elem.second.ts, elem.second.command, tbl);
+            recs_replayed++;
+        }
+    }
+    #elif STO_MAP
+    auto map_callback = [&to_epoch, &callback, &recs_replayed, &tbl] (const Str& k, logmap_rec* v) -> void {
+        if(to_epoch.value() == 0 || v->epoch.value() <= to_epoch.value()){ // only process log records with epoch within the given epoch
+            callback(k, v->val, v->ts, v->command, tbl);
+            recs_replayed++;
+        }
+    };
+    map.traverse_all(map_callback);
+    #endif
+    return recs_replayed;
+}
 
 // LOG RECORD
 
@@ -431,47 +560,79 @@ struct logmem_record {
     kvtimestamp_t ts;
     kvtimestamp_t prev_ts;
     kvepoch_t epoch;
+    int tbl;
 
     const char *extract(const char *buf, const char *end);
+    const char *extract(const char *buf, const char *end, uint32_t value_offset, bool extract_tbl); // ignore the '/' between key and val when LOG_RECS == 3!
+    // the extract_tbl is for LOGGING 1 where we have a global log (not one log per table). We also need to store for which table this log record is!
 };
 
-// replays the in-memory log up to to_epoch and returns the 
-// number of entries found.
+// replays the in-memory log up to to_epoch and returns the number of entries found.
 // replays the entire log if to_epoch == 0
+// starts playing either from the beginning of the log buffer, or from the location where it left (epoch_ptr[next_epoch])
+// tbl is the table number if selected type of log is per table, otherwise -1
 template <typename Callback>
-uint64_t logmem_replay::replay(kvepoch_t to_epoch, Callback callback){
+uint64_t logmem_replay::replay(kvepoch_t to_epoch, off_t size, Callback callback, int tbl){
     uint64_t nr = 0;
-    const char *pos = buf_, *end = buf_ + size_;
+    const char *pos;
+    const char *end = buf_ + size;
     logmem_record lr;
-    
-    std::cout<<"Replaying log of size "<< size_ <<std::endl;
+    bool play_till_epoch = to_epoch > 0;
 
+    if(play_till_epoch && info.epoch_ptr.count(info.next_epoch.value()) > 0){
+        pos = info.epoch_ptr[info.next_epoch.value()]; // start where we left off
+        //printf("Replaying from epoch %lu, tbl %d, pos %p\n", info.next_epoch.value(), tbl, pos);
+    }
+    else
+        pos = buf_; // start from the beginning
+    
+    //std::cout<<"Replaying log of size "<< size <<std::endl;
     // XXX
-    while (pos < end) {
-        const char *nextpos = lr.extract(pos, end);
+    //while (pos < end) {
+    while(true){
+        if(!play_till_epoch && pos >= end) // play till the end only if to_epoch == 0! If we play till a specific epoch, we don't know exactly the end since it is still being updated by the log writers!
+            break;
+        #if LOG_RECS < 3
+        const char *nextpos = lr.extract(pos, end, 0, (tbl==-1));
+        #elif LOG_RECS == 3
+        const char *nextpos = lr.extract(pos, end, 1, (tbl==-1));
+        #endif
         if (lr.command == logcmd_none) {
             fprintf(stderr, "replay: %" PRIu64 " entries replayed, CORRUPT @%zu\n",
                     nr, pos - buf_);
+            always_assert(false, "Corrupted Log!\n");
             break;
         }
         if(lr.command == logcmd_epoch){
-            if(to_epoch > 0 && lr.epoch > to_epoch){ // reached to_epoch: stop playing!
-                std::cout<<"Replay reached epoch "<<to_epoch.value()<<". Stop!\n";
+            if(play_till_epoch && lr.epoch > to_epoch){ // played everything till to_epoch: stop playing and save location of that epoch to next_epoch!
+                //assert(lr.epoch == to_epoch+1);
+                //std::cout<<"Replay reached epoch "<<lr.epoch.value()<<". Stop!\n";
+                info.next_epoch = lr.epoch;
+                info.epoch_ptr[lr.epoch.value()] = nextpos;
                 return nr;
             }
+        }
+        if(lr.command == logcmd_wraparound){ // wraparound
+            nextpos = buf_; // start replaying from the beginning!
+            pos = nextpos;
+            continue;
         }
         if (lr.key.len) { // skip empty entry
             if (lr.command == logcmd_put
                 || lr.command == logcmd_replace
                 || lr.command == logcmd_modify
                 || lr.command == logcmd_remove) {
-                callback(lr.key, lr.command);
+                if(!callback(lr.key, lr.val, lr.ts, lr.command, (tbl==-1 ? lr.tbl : tbl))){
+                    std::cout<<"Error in callback @Log record "<< nr << std::endl;
+                    return nr;
+                }
             }
             ++nr;
         }
         // XXX RCU
         pos = nextpos;
     }
+    always_assert(!play_till_epoch, "Reached log end and couldn't find given epoch!");
     return nr;
 }
 
@@ -569,6 +730,55 @@ struct logrec_epoch {
     }
 };
 
+// support wrapping around when log is full and log readers already caught up (periodic log drains)!
+struct logrec_wraparound {
+    uint32_t command_;
+    uint32_t size_;
+
+    static size_t size() {
+        return sizeof (logrec_wraparound);
+    }
+
+    static size_t store(char* buf, uint32_t command){
+        logrec_wraparound* lr = reinterpret_cast<logrec_wraparound*>(buf);
+        lr->command_ = command;
+        lr->size_ = sizeof(*lr);
+        return sizeof(*lr);
+    }
+
+    static bool check(const char* buf){
+        const logrec_wraparound* lr = reinterpret_cast<const logrec_wraparound*>(buf);
+        return lr->size_ >= sizeof(*lr);
+    }
+};
+
+
+// mark for which table this record is!
+struct logrec_kv_tbl  {
+    uint32_t command_;
+    uint32_t size_;
+    kvtimestamp_t ts_;
+    uint32_t keylen_;
+    char tbl_; // the table ID
+    char buf_[0];
+    // LOG_RECS == 1
+    static size_t store(char *buf, uint32_t command,
+                        Str key, Str val, char tbl,
+                        kvtimestamp_t ts) {
+        // XXX check alignment on some architectures
+        logrec_kv_tbl *lr = reinterpret_cast<logrec_kv_tbl*>(buf);
+        lr->command_ = command;
+        lr->size_ = sizeof(*lr) + key.len + val.len;
+        lr->ts_ = ts;
+        lr->keylen_ = key.len;
+        lr->tbl_ = tbl;
+        memcpy(lr->buf_, key.s, key.len);
+        memcpy(lr->buf_ + key.len, val.s, val.len);
+        return sizeof(*lr) + key.len + val.len;
+    }
+
+};
+
 struct logrec_kv {
     uint32_t command_;
     uint32_t size_;
@@ -579,6 +789,7 @@ struct logrec_kv {
     static size_t size(uint32_t keylen, uint32_t vallen) {
         return sizeof(logrec_kv) + keylen + vallen;
     }
+    // Use logrec_kv_tbl for LOG_RECS == 1 and LOGGING 1!
     static size_t store(char *buf, uint32_t command,
                         Str key, Str val,
                         kvtimestamp_t ts) {
@@ -588,23 +799,41 @@ struct logrec_kv {
         lr->size_ = sizeof(*lr) + key.len + val.len;
         lr->ts_ = ts;
         lr->keylen_ = key.len;
+        // TODO: check where is the highest cost of storing.
         memcpy(lr->buf_, key.s, key.len);
         memcpy(lr->buf_ + key.len, val.s, val.len);
         return sizeof(*lr) + key.len + val.len;
     }
-    static uint32_t store_digits(char* buf, uint64_t num){
-        uint32_t pos = 0;
+    // LOG_RECS == 2
+    static size_t store(char *buf, uint32_t command,
+                        const void* keyp, uint32_t keylen, const void* valp, uint32_t vallen,
+                        kvtimestamp_t ts){
+        logrec_kv *lr = reinterpret_cast<logrec_kv *>(buf);
+        lr->command_ = command;
+        lr->size_ = sizeof(*lr) + keylen + vallen;
+        lr->ts_ = ts;
+        lr->keylen_ = keylen;
+        memcpy(lr->buf_, keyp, keylen);
+        memcpy(lr->buf_ + keylen, valp, vallen);
+        return sizeof(*lr) + keylen + vallen;
+    }
+    // LOG_RECS == 3
+    static void store_digits(char* buf, uint64_t num, uint32_t& pos){
+        uint32_t pos_lcl = 0;
         uint32_t div=1;
-        while((num/div) > 9){
+        // store digits in reverse order so that to read them easier on log replay! We will simply multiply
+        // with 1 and keep multiplying with 10 on every digit we encounter!
+        if(num==0){
+            buf[pos_lcl++] = 0;
+        }
+        while((num / div) > 0){
+            char digit = (num / div) % 10;
+            buf[pos_lcl++] = digit;
             div *= 10;
         }
-        while(div > 0){
-            char digit = (num / div) % 10;
-            buf[pos++] = digit;
-            div /= 10;
-        }
-        return pos;
+        pos += pos_lcl;
     }
+    // LOG_RECS == 3
     static size_t store_str(char *buf, uint32_t command,
                         Str key, Str val,
                         kvtimestamp_t ts, uint32_t tbl){
@@ -629,25 +858,25 @@ struct logrec_kv {
             order_key * k = (order_key*) key.s;
             uint32_t pos = 0;
             // store each portion of the key separately, digit by digit
-            pos = store_digits(lr->buf_+pos, __bswap_64(k->w_id));
+            store_digits(lr->buf_+pos, __bswap_64(k->w_id), pos);
             lr->buf_[pos++] = ',';
-            pos = store_digits(lr->buf_+pos, __bswap_64(k->d_id));
+            store_digits(lr->buf_+pos, __bswap_64(k->d_id), pos);
             lr->buf_[pos++] = ',';
-            pos = store_digits(lr->buf_+pos, __bswap_64(k->o_id));
+            store_digits(lr->buf_+pos, __bswap_64(k->o_id), pos);
             lr->keylen_ = pos;
             lr->buf_[pos++] = '/';
-
+            
             order_value * v = (order_value*) val.s;
             // store each portion of the value separately, digit by digit
-            pos = store_digits(lr->buf_+pos, v->o_c_id);
+            store_digits(lr->buf_+pos, v->o_c_id, pos);
             lr->buf_[pos++] = ',';
-            pos = store_digits(lr->buf_+pos, v->o_carrier_id);
+            store_digits(lr->buf_+pos, v->o_carrier_id, pos);
             lr->buf_[pos++] = ',';
-            pos = store_digits(lr->buf_+pos, v->o_entry_d);
+            store_digits(lr->buf_+pos, v->o_entry_d, pos);
             lr->buf_[pos++] = ',';
-            pos = store_digits(lr->buf_+pos, v->o_ol_cnt);
+            store_digits(lr->buf_+pos, v->o_ol_cnt, pos);
             lr->buf_[pos++] = ',';
-            pos = store_digits(lr->buf_+pos, v->o_all_local);
+            store_digits(lr->buf_+pos, v->o_all_local, pos);
             lr->buf_[pos++] = '/';
             
             lr->size_ = sizeof(*lr) + pos;
@@ -657,14 +886,14 @@ struct logrec_kv {
             class __attribute__((packed)) fix_string {
             public:
                 fix_string() {
-                    memset(s_, ' ', 25);
+                    memset(s_, ' ', 24);
                 }
                 explicit operator std::string() {
-                    return std::string(s_, 25);
+                    return std::string(s_, 24);
                 }
 
             private:
-                char s_[25];
+                char s_[24];
             };
                 
             struct orderline_key {
@@ -684,48 +913,36 @@ struct logrec_kv {
             orderline_key * k = (orderline_key*) key.s;
             uint32_t pos = 0;
             // store each portion of the key separately, digit by digit
-            pos = store_digits(lr->buf_+pos, __bswap_64(k->ol_w_id));
+            store_digits(lr->buf_+pos, __bswap_64(k->ol_w_id), pos);
             lr->buf_[pos++] = ',';
-            pos = store_digits(lr->buf_+pos, __bswap_64(k->ol_d_id));
+            store_digits(lr->buf_+pos, __bswap_64(k->ol_d_id), pos);
             lr->buf_[pos++] = ',';
-            pos = store_digits(lr->buf_+pos, __bswap_64(k->ol_o_id));
+            store_digits(lr->buf_+pos, __bswap_64(k->ol_o_id), pos);
             lr->buf_[pos++] = ',';
-            pos = store_digits(lr->buf_+pos, __bswap_64(k->ol_number));
+            store_digits(lr->buf_+pos, __bswap_64(k->ol_number), pos);
             lr->keylen_ = pos;
             lr->buf_[pos++] = '/';
             
             orderline_value * v = (orderline_value*) val.s;
             // store each portion of the value separately, digit by digit
-            pos = store_digits(lr->buf_+pos, v->ol_i_id);
+            store_digits(lr->buf_+pos, v->ol_i_id, pos);
             lr->buf_[pos++] = ',';
-            pos = store_digits(lr->buf_+pos, v->ol_supply_w_id);
+            store_digits(lr->buf_+pos, v->ol_supply_w_id, pos);
             lr->buf_[pos++] = ',';
-            pos = store_digits(lr->buf_+pos, v->ol_delivery_d);
+            store_digits(lr->buf_+pos, v->ol_delivery_d, pos);
             lr->buf_[pos++] = ',';
-            pos = store_digits(lr->buf_+pos, v->ol_quantity);
+            store_digits(lr->buf_+pos, v->ol_quantity, pos);
             lr->buf_[pos++] = ',';
-            pos = store_digits(lr->buf_+pos, v->ol_amount);
+            store_digits(lr->buf_+pos, v->ol_amount, pos);
             lr->buf_[pos++] = ',';
-            memcpy(lr->buf_+pos, std::string(v->ol_dist_info).c_str(), 25);
-            pos+=25;
+            memcpy(lr->buf_+pos, std::string(v->ol_dist_info).c_str(), 24);
+            pos+=24;
             lr->buf_[pos++] = '/';
             
             lr->size_ = sizeof(*lr) + pos;
             return sizeof(*lr) + pos;
         }
         return 0;
-    }
-    static size_t store(char *buf, uint32_t command,
-                        void* keyp, uint32_t keylen, void* valp, uint32_t vallen,
-                        kvtimestamp_t ts){
-        logrec_kv *lr = reinterpret_cast<logrec_kv *>(buf);
-        lr->command_ = command;
-        lr->size_ = sizeof(*lr) + keylen + vallen;
-        lr->ts_ = ts;
-        lr->keylen_ = keylen;
-        memcpy(lr->buf_, keyp, keylen);
-        memcpy(lr->buf_ + keylen, valp, vallen);
-        return sizeof(*lr) + keylen + vallen;
     }
     static bool check(const char *buf) {
         const logrec_kv *lr = reinterpret_cast<const logrec_kv *>(buf);
@@ -760,7 +977,7 @@ struct logrec_kvdelta {
         return sizeof(*lr) + key.len + val.len;
     }
     static size_t store(char *buf, uint32_t command,
-                        void* keyp, uint32_t keylen, void* valp, uint32_t vallen,
+                        const void* keyp, uint32_t keylen, const void* valp, uint32_t vallen,
                         kvtimestamp_t prev_ts, kvtimestamp_t ts) {
         // XXX check alignment on some architectures
         logrec_kvdelta *lr = reinterpret_cast<logrec_kvdelta *>(buf);
@@ -824,8 +1041,12 @@ inline const loginfo& logset::log(int i) const {
 \*_________________________*/
 template <int N_TBLS>
 loginfo_map<N_TBLS>::loginfo_map(int logindex) {
-    for(int i=0; i<N_TBLS; i++)
-        map[i] = loginfo_map<N_TBLS>::logmap_t(1024 * 1024);
+    for(int i=0; i<N_TBLS; i++) {
+        map[i] = logmap_t(1024 * 1024);
+        #if MEASURE_MAP_SZ
+        size[i]=0;
+        #endif
+    }
     ti_ = 0;
     logindex_ = logindex;
 }
@@ -840,27 +1061,38 @@ void loginfo_map<N_TBLS>::record(int command, const loginfo::query_times& qt, St
     #if STD_MAP
     auto elem = m.find(key);
     if( elem!= m.end()){ // found - check epoch!
-        logrec& rec = elem->second;
+        logmap_rec & rec = elem->second;
         if(rec.epoch < qt.epoch){ // new log record has a newer epoch than existing log record! Create a new one and chain it! - we expect to only have up to 2 elements in the chain since the log drainer creates new epoch and once done we can discard the older epochs.
-            logrec * newrec = new logrec(command, value, qt.epoch, qt.ts, nullptr);
+            logmap_rec * newrec = new logmap_rec(command, value, qt.epoch, qt.ts, nullptr);
             rec.next = newrec;
+            #if MEASURE_MAP_SZ
+            size[tbl] += sizeof(logmap_rec);
+            #endif
         }
     }
     else {
-        m[key] = logrec(command, value, qt.epoch, qt.ts, nullptr);
+        m[key] = logmap_rec(command, value, qt.epoch, qt.ts, nullptr);
+        #if MEASURE_MAP_SZ
+            size[tbl] += sizeof(logmap_rec);
+        #endif
     }
     #elif STO_MAP
     auto * elem = m.nontrans_get(key);
     if (elem != nullptr){ // found - check epoch!
         if(elem->epoch < qt.epoch){
-            logrec * newrec = new logrec(command, value, qt.epoch, qt.ts, nullptr);
+            logmap_rec * newrec = new logmap_rec(command, value, qt.epoch, qt.ts, nullptr);
             elem->next = newrec;
+            #if MEASURE_MAP_SZ
+            size[tbl] += sizeof(logmap_rec);
+            #endif
         }
     }
     else{
-        m.nontrans_put(key, logrec(command, value, qt.epoch, qt.ts, nullptr));
+        m.nontrans_put_no_lock(key, logmap_rec(command, value, qt.epoch, qt.ts, nullptr));
+        #if MEASURE_MAP_SZ
+        size[tbl] += sizeof(logmap_rec);
+        #endif
     }
-
     #endif
 }
 
@@ -960,6 +1192,18 @@ inline int logset_tbl<N_TBLS>::size() const {
     return li_[-1].lsi_.size_;
 }
 
+#if LOG_DRAIN_REQUEST
+/*template <int N_TBLS>
+inline bool logset_tbl<N_TBLS>::has_logdrain_request(){
+    return li_[-1].lsi_.request_log_drain;
+}
+
+template <int N_TBLS>
+inline void logset_tbl<N_TBLS>::set_logdrain_request(bool req){
+    li_[-1].lsi_.request_log_drain = req;
+}
+*/
+#endif
 
 /*=========================*\
 |       loginfo_tbl      |
@@ -985,13 +1229,24 @@ loginfo_tbl<N_TBLS>::loginfo_tbl(logset_tbl<N_TBLS>* ls, int logindex, std::vect
     buf_ = (char *) malloc(total_len);
     always_assert(buf_);
 
+    #if LOG_DRAIN_REQUEST
+    // initialize mutex and condition variable for this log
+    int r = pthread_mutex_init(&mutex, 0);
+    always_assert(r>=0, "Error creating mutex!\n"); 
+    r = pthread_cond_init(&logdrain_start_cond, 0);
+    if (r< 0){
+        pthread_mutex_destroy(&mutex);
+        always_assert(false, "Error creating condition variable!\n");
+    }
+    #endif
+
     // std::cout<<"Total log size: "<< total_len<<std::endl;
     for(int tbl=0; tbl<N_TBLS; tbl++){
         start_[tbl] = pos_[tbl] = tbl==0 ? 0 : (pos_[tbl-1] + len_[tbl-1]);
         //std::cout<<"Table "<< tbl<<": pos_: "<< pos_[tbl]<<", len_: "<< len_[tbl]<<std::endl;
     }
     //std::cout<<"sizeof loginfo_tbl: "<<sizeof(*this)<<std::endl;
-    log_epoch_ = 0;
+    log_epoch_ = 1;
     //quiescent_epoch_ = 0;
     //wake_epoch_ = 0;
     //flushed_epoch_ = 0;
@@ -1005,6 +1260,10 @@ loginfo_tbl<N_TBLS>::loginfo_tbl(logset_tbl<N_TBLS>* ls, int logindex, std::vect
 template <int N_TBLS>
 loginfo_tbl<N_TBLS>::~loginfo_tbl(){
     free(buf_);
+    #if LOG_DRAIN_REQUEST
+    pthread_mutex_destroy(&mutex);
+    pthread_cond_destroy(&logdrain_start_cond);
+    #endif
 }
 
 template <int N_TBLS>
@@ -1029,9 +1288,10 @@ inline const loginfo_tbl<N_TBLS>& logset_tbl<N_TBLS>::log(int i) const{
     return li_[i];
 }
 
-// Record log entry by storing the actual key and value (not converting to string)
+// Record log entry by storing the to_str() representation, which converts key/val to char*
+// LOG_RECS == 2
 template <int N_TBLS>
-void loginfo_tbl<N_TBLS>::record(int command, const loginfo::query_times& qtimes, void* keyp, uint32_t keylen, void* valp, uint32_t vallen, int tbl){
+void loginfo_tbl<N_TBLS>::record(int command, const loginfo::query_times& qtimes, const void* keyp, uint32_t keylen, const void* valp, uint32_t vallen, int tbl){
     size_t n = logrec_kvdelta::size(keylen, vallen)
         + logrec_epoch::size();
     int stalls = 0;
@@ -1042,18 +1302,14 @@ void loginfo_tbl<N_TBLS>::record(int command, const loginfo::query_times& qtimes
                 log_epoch_ = qtimes.epoch;
                 //std::cout<<"changing log_epoch to: "<< log_epoch_.value()<<std::endl;
                 pos_[tbl] += logrec_epoch::store(buf_ + pos_[tbl], logcmd_epoch, qtimes.epoch);
-                #if MEASURE_LOG_RECORDS
-                incr_cur_log_records();
-                #endif
             }
-            if (command == logcmd_put && qtimes.prev_ts
+            /*if (command == logcmd_put && qtimes.prev_ts
                 && !(qtimes.prev_ts & 1))
                 pos_[tbl] += logrec_kvdelta::store(buf_ + pos_[tbl],
                                               logcmd_modify, keyp, keylen, valp, vallen,
                                               qtimes.prev_ts, qtimes.ts);
-            else
-                pos_[tbl] += logrec_kv::store(buf_ + pos_[tbl],
-                                         command, keyp, keylen, valp, vallen, qtimes.ts);
+            else*/
+            pos_[tbl] += logrec_kv::store(buf_ + pos_[tbl], command, keyp, keylen, valp, vallen, qtimes.ts);
             assert(command != logcmd_none);
             #if MEASURE_LOG_RECORDS
             incr_cur_log_records();
@@ -1064,89 +1320,101 @@ void loginfo_tbl<N_TBLS>::record(int command, const loginfo::query_times& qtimes
             printf("stall\n");
     }
 }
-// Recrod log entry by storing a string representation of key and value
-// tbl: The table where the log record belongs to
+
+// Record a new epoch entry! This is required when we want to signal the log drainers that we are already at the new epoch and it is safe to drain all records belonging to the previous epoch.
 template <int N_TBLS>
-void loginfo_tbl<N_TBLS>::record(int command, const loginfo::query_times& qtimes, Str key, Str value, int tbl){
+void loginfo_tbl<N_TBLS>::record_new_epoch(int tbl, kvepoch_t new_epoch){
+    size_t n = logrec_epoch::size() + logrec_wraparound::size();
+    if ((start_[tbl]+len_[tbl]) - pos_[tbl] >= n) {
+        pos_[tbl] += logrec_epoch::store(buf_ + pos_[tbl], logcmd_epoch, new_epoch);
+    }
+    else { // wraparound
+        std::cout<<"Log wraparound. Make sure to run logdrainers!\n";
+        assert(pos_[tbl] + logrec_wraparound::size() <= start_[tbl] + len_[tbl]);
+        logrec_wraparound::store(buf_ + pos_[tbl], logcmd_wraparound);
+        pos_[tbl] = start_[tbl];
+        pos_[tbl] += logrec_epoch::store(buf_ + pos_[tbl], logcmd_epoch, new_epoch);
+    }
+}
+
+
+// Record log entry by storing a string representation of key and value
+// tbl: The table where the log record belongs to
+// LOG_RECS == 1,3
+template <int N_TBLS>
+uint32_t loginfo_tbl<N_TBLS>::record(int command, const loginfo::query_times& qtimes, Str key, Str value, int tbl, int pos){
     //pos_[tbl];    the position in the buffer where the next log record for this table should be stored
     //start_[tbl];  the position in the buffer where the log records for this table start
     //len_[tbl];    the capacity of the log for this table
 
-    //assert(!recovering);
+    // needed for LOGREC_OVERWRITE
+    #if LOGREC_OVERWRITE
+    uint32_t logrec_start_pos=pos_[tbl];
+    uint32_t log_offset = (pos>=0 ? pos : pos_[tbl] );
+    #else
+    uint32_t logrec_start_pos=0;
+    (void)pos;
+    #endif
     //size_t n = logrec_kvdelta::size(key.len, value.len)
     //    + logrec_epoch::size() + logrec_base::size();
     // not needed for in-memory log
     size_t n = logrec_kvdelta::size(key.len, value.len)
-        + logrec_epoch::size();
-    //TODO: no need for locks since we use one log per thread!
-    //waitlist wait = { &wait };
-    int stalls = 0;
+        + logrec_epoch::size() + logrec_wraparound::size();
+    //int stalls = 0;
     while (1) {
         //TODO: no need for locks since we use one log per thread!
         if ((start_[tbl]+len_[tbl]) - pos_[tbl] >= n) {
-        //if ((start_[tbl]+len_[tbl]) - pos_[tbl] >= n
-        //    && (wait.next == &wait || f_.waiting_ == &wait)) {
-            //kvepoch_t we = global_wake_epoch;
-
             // Potentially record a new epoch.
             if (qtimes.epoch != log_epoch_) {
                 log_epoch_ = qtimes.epoch;
                 //std::cout<<"changing log_epoch to: "<< log_epoch_.value()<<std::endl;
                 pos_[tbl] += logrec_epoch::store(buf_ + pos_[tbl], logcmd_epoch, qtimes.epoch);
-                #if MEASURE_LOG_RECORDS
-                incr_cur_log_records();
+                #if LOGREC_OVERWRITE
+                // update log pos after we added a new epoch logrec!
+                logrec_start_pos = pos_[tbl];
+                if(pos<0)
+                    log_offset = pos_[tbl];
                 #endif
             }
-            if (command == logcmd_put && qtimes.prev_ts
+            /*if (command == logcmd_put && qtimes.prev_ts
                 && !(qtimes.prev_ts & 1))
                 pos_[tbl] += logrec_kvdelta::store(buf_ + pos_[tbl],
-                                              logcmd_modify, key, value,
-                                              qtimes.prev_ts, qtimes.ts);
-            else {
-                if(tbl == 3 || tbl == 4)
-                    pos_[tbl] += logrec_kv::store_str(buf_ + pos_[tbl],
-                                         command, key, value, qtimes.ts, tbl);
-                else 
-                    pos_[tbl] += logrec_kv::store(buf_ + pos_[tbl],
-                                         command, key, value, qtimes.ts);
-            }
+                                                logcmd_modify, key, value,
+                                                qtimes.prev_ts, qtimes.ts);
+            else {*/
+            #if LOG_RECS == 1
+            #if LOGREC_OVERWRITE
+            uint32_t rec_sz = logrec_kv::store(buf_ + log_offset,
+                                        command, key, value, qtimes.ts);
+            if(pos < 0) // do not advance the pos pointer if we run replace on an existing log record! Log record was updated in-place. pos >=0 means that we want to update in-place
+                pos_[tbl] += rec_sz;
+            #else
+            pos_[tbl] += logrec_kv::store(buf_ + pos_[tbl],
+                                        command, key, value, qtimes.ts);
+            #endif
+            #elif LOG_RECS == 3 // convert key/val to string digit by digit
+            if(tbl == 3 || tbl == 4)
+                pos_[tbl] += logrec_kv::store_str(buf_ + pos_[tbl],
+                                        command, key, value, qtimes.ts, tbl);
+            else 
+                pos_[tbl] += logrec_kv::store(buf_ + pos_[tbl],
+                                        command, key, value, qtimes.ts);
+            #endif
+            //}
             assert(command != logcmd_none);
             #if MEASURE_LOG_RECORDS
             incr_cur_log_records();
             #endif
-            //TODO: no need for locks since we use one log per thread!
-            //if (f_.waiting_ == &wait)
-            //    f_.waiting_ = wait.next;
-            //release();
-            return;
+            return logrec_start_pos;
         }
-        //printf("wait.next == wait? %d, f_.waiting_ == wait? %d\n", (wait.next == &wait) ,  (f_.waiting_ == &wait) );
-        //TODO: no need for locks since we use one log per thread!
-        // Otherwise must spin
-        /*if (wait.next == &wait) {
-            waitlist** p = &f_.waiting_;
-            while (*p)
-                p = &(*p)->next;
-            *p = &wait;
-            wait.next = 0;
+        else { // wraparound!
+            std::cout<<"Log wraparound. Make sure to run logdrainers!\n";
+            assert(pos_[tbl] + logrec_wraparound::size() <= start_[tbl] + len_[tbl]);
+            logrec_wraparound::store(buf_ + pos_[tbl], logcmd_wraparound);
+            pos_[tbl] = start_[tbl];
         }
-        release();
-        if (stalls == 0)
-            printf("stall\n");
-        else if (stalls % 25 == 0) {
-            printf("stall %d\n", stalls);
-        }
-        ++stalls;
-        napms(50);
-        acquire();
-        */
-       if (stalls == 0)
-            printf("stall\n");
     }
 }
-
-
-
 
 template <typename R>
 struct row_delta_marker : public row_marker {
