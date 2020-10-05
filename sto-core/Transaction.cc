@@ -448,13 +448,17 @@ bool Transaction::try_commit() {
 #else
     if (nwriteset) {
         auto writeset_end = writeset + nwriteset;
+        bool firstTItem=true; // Dimos; we need to know if it's the first TItem for the current transaction, in order to change log epoch if needed, for the log!
         for (auto idxit = writeset; idxit != writeset_end; ++idxit) {
             if (likely(*idxit < tset_initial_capacity))
                 it = &tset0_[*idxit];
             else
                 it = &tset_[*idxit / tset_chunk][*idxit % tset_chunk];
             TXP_INCREMENT(txp_total_w);
+            if(firstTItem)
+                it->__or_flags(TransItem::first_titem_bit);
             it->owner()->install(*it, *this);
+            firstTItem=false;
         }
     }
 #endif
