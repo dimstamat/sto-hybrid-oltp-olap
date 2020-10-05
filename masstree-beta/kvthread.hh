@@ -117,7 +117,7 @@ class threadinfo {
         return (loginfo*)logger_;
     }
 
-    void* logger_tables() const{
+    void* logger_tbl() const{
         return logger_;
     }
     
