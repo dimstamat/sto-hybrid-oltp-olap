@@ -1092,6 +1092,10 @@ public:
         return prev_commit_tid_;
     }
 
+    tid_type get_commit_tid() const {
+        return commit_tid_;
+    }
+
     inline tid_type compute_tictoc_commit_ts() const;
 
     template <typename VersImpl>
@@ -1109,6 +1113,16 @@ public:
         item.clear_needs_unlock();
     }
 
+    // Dimos : we need to know the version's value so that to use it for the log.
+    // We must save the version before we actually unlock the internal elem, since concurrent threads could lock and change the version!
+    template <typename VersImpl>
+    tid_type set_version_unlock_return(VersionBase<VersImpl>& version, TransItem& item, typename VersionBase<VersImpl>::type flags = 0) const {
+        assert(state_ == s_committing_locked || state_ == s_committing);
+        tid_type v = version.cp_commit_tid(const_cast<Transaction &>(*this));
+        version.cp_set_version_unlock(v | flags);
+        item.clear_needs_unlock();
+        return v;
+    }
     template <typename VersImpl>
     void assign_version_unlock(VersionBase<VersImpl>& version, TransItem& item, typename VersionBase<VersImpl>::type flags = 0) const {
         tid_type v = version.cp_commit_tid(const_cast<Transaction &>(*this));
