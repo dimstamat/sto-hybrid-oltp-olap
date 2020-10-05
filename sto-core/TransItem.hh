@@ -42,12 +42,14 @@ class TransItem {
     static constexpr flags_type cl_bit = flags_type(1) << 58;
     static constexpr flags_type commute_bit = flags_type(1) << 57;
     static constexpr flags_type mvhistory_bit = flags_type(1) << 56;
+    static constexpr flags_type first_titem_bit = flags_type(1) << 55; // Dimos: We need to know whether a TItem is the first in a transaction, so that to advance the log epoch if needed, when applying log records!
     static constexpr flags_type pointer_mask = (flags_type(1) << 48) - 1;
     static constexpr flags_type owner_mask = pointer_mask;
     static constexpr flags_type user0_bit = flags_type(1) << 48;
     static constexpr int userf_shift = 48;
     static constexpr flags_type shifted_userf_mask = 0x7FF;
-    static constexpr flags_type special_mask = owner_mask | cl_bit | read_bit | write_bit | lock_bit | predicate_bit | stash_bit | commute_bit | mvhistory_bit;
+    //static constexpr flags_type special_mask = owner_mask | cl_bit | read_bit | write_bit | lock_bit | predicate_bit | stash_bit | commute_bit | mvhistory_bit;
+    static constexpr flags_type special_mask = owner_mask | cl_bit | read_bit | write_bit | lock_bit | predicate_bit | stash_bit | commute_bit | mvhistory_bit | first_titem_bit;
 
 
     TransItem() : s_(), key_(), rdata_(), wdata_(), mode_(CCMode::none) {};
