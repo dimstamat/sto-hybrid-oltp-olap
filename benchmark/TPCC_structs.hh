@@ -681,7 +681,7 @@ struct order_comm_value {
     uint64_t o_carrier_id;
 };
 #else
-struct order_value{
+struct order_value {
     enum class NamedColumn : int { o_c_id = 0,
                                    o_carrier_id,
                                    o_entry_d,
@@ -803,8 +803,38 @@ struct order_sec_key {
 };
 
 struct order_sec_value {
-    enum class NamedColumn : int { o_c_entry_d_p = 0 }; 
+    enum class NamedColumn : int { o_c_entry_d_p = 0
+    #if EXTENDED_SEC_INDEX
+    , o_q_res = 1
+    #endif
+     };
     uint64_t* o_c_entry_d_p; // the pointer to the value holding the entry date (o_entry_d) which will be a struct order_value
+    #if EXTENDED_SEC_INDEX
+    std::atomic_char query_result;
+    #if !INVALIDATE
+    std::atomic<uint32_t> epoch;
+    #endif
+    //order_sec_value() : query_result(0), epoch(0){
+    order_sec_value() : query_result(0)
+    #if !INVALIDATE
+    , epoch(0)
+    #endif
+    {
+    }
+    order_sec_value(const order_sec_value& other){
+        // slight performance difference if we use memcpy, or direct assignment.
+        // we don't have to copy the value of the query_result here because we never use copy constructor to copy it!
+        this->o_c_entry_d_p = other.o_c_entry_d_p;
+        //memcpy(this, &other, sizeof(other));
+    }
+    order_sec_value& operator =(const order_sec_value& other){
+        // slight performance difference if we use memcpy, or direct assignment.
+        // we don't have to copy the value of the query_result here because we never use assignemnt operator to copy it!
+        this->o_c_entry_d_p = other.o_c_entry_d_p;
+        //memcpy(this, &other, sizeof(other));
+        return *this;
+    }
+    #endif
 
     operator lcdf::Str() const {
         return lcdf::Str((const char*)this, sizeof(*this));
@@ -841,8 +871,15 @@ struct orderline_sec_key {
 };
 
 struct orderline_sec_value {
-    enum class NamedColumn : int { ol_c_delivery_d_p = 0 }; 
+    enum class NamedColumn : int { ol_c_delivery_d_p = 0
+    #if EXTENDED_SEC_INDEX
+    , ol_q_res = 1
+    #endif
+     }; 
     uint64_t* ol_c_delivery_d_p; // the pointer to the value holding the delivery date (ol_delivery_d) which will be a struct orderline_value
+    #if EXTENDED_SEC_INDEX
+    char query_result;
+    #endif
 
     operator lcdf::Str() const {
         return lcdf::Str((const char*)this, sizeof(*this));
