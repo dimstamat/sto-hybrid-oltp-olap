@@ -186,9 +186,15 @@ void* loginfo::run() {
     return 0;
 }
 
-// log entry format: see log.hh
+
 void loginfo::record(int command, const query_times& qtimes,
                      Str key, Str value) {
+    return record(command, qtimes, key, value, 0);
+}
+
+// log entry format: see log.hh
+void loginfo::record(int command, const query_times& qtimes,
+                     Str key, Str value, char tbl) {
     assert(!recovering);
     //size_t n = logrec_kvdelta::size(key.len, value.len)
     //    + logrec_epoch::size() + logrec_base::size();
@@ -208,7 +214,7 @@ void loginfo::record(int command, const query_times& qtimes,
             // Potentially record a new epoch.
             if (qtimes.epoch != log_epoch_) {
                 log_epoch_ = qtimes.epoch;
-                std::cout<<"log_epoch: "<< log_epoch_<<std::endl;
+                //std::cout<<"log_epoch: "<< log_epoch_<<std::endl;
                 pos_ += logrec_epoch::store(buf_ + pos_, logcmd_epoch, qtimes.epoch);
                 #if MEASURE_LOG_RECORDS
                 incr_cur_log_records();
@@ -248,8 +254,8 @@ void loginfo::record(int command, const query_times& qtimes,
                                               logcmd_modify, key, value,
                                               qtimes.prev_ts, qtimes.ts);
             else
-                pos_ += logrec_kv::store(buf_ + pos_,
-                                         command, key, value, qtimes.ts);
+                pos_ += logrec_kv_tbl::store(buf_ + pos_,
+                                         command, key, value, tbl, qtimes.ts);
             #if MEASURE_LOG_RECORDS
             incr_cur_log_records();
             #endif
@@ -322,15 +328,17 @@ void logrecord::parse(){
 }
 
 
-
+// if extract_tbl=true, then we know that it is the default log and we need to extract the table id too! (LOGGING==1)
+// otherwise we don't need to extract the table id from the log record since the log record is stored in the appropriate position in the log (log is partitioned), (LOGGING==2)
 const char *
-logmem_record::extract(const char *buf, const char *end)
+logmem_record::extract(const char *buf, const char *end, uint32_t value_offset=0, bool extract_tbl=false)
 {
     const logrec_base *lr = reinterpret_cast<const logrec_base *>(buf);
     if (unlikely(size_t(end - buf) < sizeof(*lr)
                  || lr->size_ < sizeof(*lr)
                  || size_t(end - buf) < lr->size_
                  || lr->command_ == logcmd_none)) {
+                     std::cout<<"OOOPS! end - buf: "<< size_t(end - buf) <<", sizeof(*lr): "<< sizeof(*lr)<< ", lr->size_: "<< lr->size_ << ", lr->command == none? "<< (lr->command_ == logcmd_none) <<"\n";
     fail:
         command = logcmd_none;
         return end;
@@ -339,30 +347,57 @@ logmem_record::extract(const char *buf, const char *end)
     command = lr->command_;
     if (command == logcmd_put || command == logcmd_replace
         || command == logcmd_remove) {
-        const logrec_kv *lk = reinterpret_cast<const logrec_kv *>(buf);
-        if (unlikely(lk->size_ < sizeof(*lk)
+        if (extract_tbl){ // we need to extract the table id from the log record
+            const logrec_kv_tbl * lk = reinterpret_cast<const logrec_kv_tbl*> (buf);
+            if (unlikely(lk->size_ < sizeof(*lk)
                      || lk->keylen_ > MASSTREE_MAXKEYLEN
-                     || sizeof(*lk) + lk->keylen_ > lk->size_))
+                     || sizeof(*lk) + lk->keylen_ > lk->size_)){
+                         std::cout<<"OOOPS 2\n";
             goto fail;
-        ts = lk->ts_;
-        key.assign(lk->buf_, lk->keylen_);
-        val.assign(lk->buf_ + lk->keylen_, lk->size_ - sizeof(*lk) - lk->keylen_);
+                     }
+            ts = lk->ts_;
+            tbl = lk->tbl_;
+            key.assign(lk->buf_, lk->keylen_);
+            val.assign(lk->buf_ + lk->keylen_ + value_offset, lk->size_ - sizeof(*lk) - lk->keylen_ - (2*value_offset)); // ignore the '/' between key and val and the last '/' after val when LOG_RECS == 3!
+        }
+        else {// regular case, do not extract the table id from log record since it is already stored in the right log in loginfo_tbl<N_TABLES>
+            const logrec_kv* lk = reinterpret_cast<const logrec_kv*> (buf);
+            if (unlikely(lk->size_ < sizeof(*lk)
+                     || lk->keylen_ > MASSTREE_MAXKEYLEN
+                     || sizeof(*lk) + lk->keylen_ > lk->size_)){
+                         std::cout<<"OOOPS 3\n";
+            goto fail;
+                     }
+            ts = lk->ts_;
+            key.assign(lk->buf_, lk->keylen_);
+            val.assign(lk->buf_ + lk->keylen_ + value_offset, lk->size_ - sizeof(*lk) - lk->keylen_ - (2*value_offset)); // ignore the '/' between key and val and the last '/' after val when LOG_RECS == 3!
+        }
     } else if (command == logcmd_modify) {
         const logrec_kvdelta *lk = reinterpret_cast<const logrec_kvdelta *>(buf);
         if (unlikely(lk->keylen_ > MASSTREE_MAXKEYLEN
-                     || sizeof(*lk) + lk->keylen_ > lk->size_))
+                     || sizeof(*lk) + lk->keylen_ > lk->size_)){
+                         std::cout<<"OOOPS 4\n";
             goto fail;
+                     }
         ts = lk->ts_;
         prev_ts = lk->prev_ts_;
         key.assign(lk->buf_, lk->keylen_);
-        val.assign(lk->buf_ + lk->keylen_, lk->size_ - sizeof(*lk) - lk->keylen_);
+        val.assign(lk->buf_ + lk->keylen_ + value_offset, lk->size_ - sizeof(*lk) - lk->keylen_ - (2*value_offset)); // ignore the '/' between key and val and the last '/' after val when LOG_RECS == 3!
     } else if (command == logcmd_epoch) {
         const logrec_epoch *lre = reinterpret_cast<const logrec_epoch *>(buf);
-        if (unlikely(lre->size_ < logrec_epoch::size()))
+        if (unlikely(lre->size_ < logrec_epoch::size())){
+            std::cout<<"OOOPS 5\n";
             goto fail;
+        }
         epoch = lre->epoch_;
     }
-
+    else if (command == logcmd_wraparound){
+        const logrec_wraparound* lrw = reinterpret_cast<const logrec_wraparound*>(buf);
+        if (unlikely(lrw->size_ < logrec_wraparound::size())){
+            std::cout<<"OOOPS 6\n";
+            goto fail;
+        }
+    }
     return buf + lr->size_;
 }
 
