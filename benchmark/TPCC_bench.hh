@@ -85,9 +85,10 @@ static uint64_t latencies_orderline_scan[tpch_thrs_size][2];
 
 // 1: change epoch every X ms
 // 2: change epoch every X committed transactions in TPC-C
-#define CHANGE_EPOCH 2
-
+#define CHANGE_EPOCH 1
+#if CHANGE_EPOCH == 2
 #define MEASURE_TPCH_PER_EPOCH 1
+#endif
 
 #define NLOGGERS 10
 #define MAX_TPCC_THREADS 10
@@ -97,10 +98,16 @@ static uint64_t latencies_orderline_scan[tpch_thrs_size][2];
 // 3: std::unordered_map at OLAP side
 // 4: STO uindex at OLAP side
 #define DICTIONARY 0
+#if DICTIONARY 
 // the initial size that we allocate for the dictionary (number of buckets in the map)
 #define INIT_DICT_SZ 2000000
 // the maximum size for the dictionary (the size of the static array)
 #define MAX_DICT_SZ 4000000
+#endif
+
+#define EXTENDED_SEC_INDEX 0
+#define INVALIDATE 0
+
 // when to add to log
 // 1 for cleanup, 2 for install
 #define ADD_TO_LOG (LOGGING>0? 2 : 0)
@@ -280,7 +287,10 @@ public:
 private:
     std::mt19937 gen;
     uint64_t num_whs_;
-    static constexpr uint32_t min_date = 1505244122;
+    static constexpr uint32_t min_date = 1505244122; // default - 94m
+    //static constexpr uint32_t min_date = 900524419;    // 700m
+    //static constexpr uint32_t min_date = 15;    // 1.6t
+    
     static constexpr uint32_t max_date = 1599938522;
 };
 
@@ -1377,7 +1387,8 @@ public:
         #endif
         tpch_db * dbp = reinterpret_cast<tpch_db*>(olap_db);
         tpcc::tpcc_input_generator ig(runner_id, dbp->num_warehouses());
-        tpch::tpch_runner<DBParams> runner(runner_id, ig, olap_db);
+        std::vector<tpch::query_type> queries({tpch::query_type::Q4});
+        tpch::tpch_runner<DBParams> runner(runner_id, ig, queries, olap_db);
         ::TThread::set_id(runner_id);
         set_affinity(runner_id);
         dbp->thread_init_all();
@@ -1387,11 +1398,15 @@ public:
         #if TPCH_REPLICA && LOG_DRAIN_REQUEST
         #if CHANGE_EPOCH == 1
         int div = 50; // perform a DB sync every time_limit / div : with 10 secs time_limit and div 50, it will perform DB sync every 200ms
+        //int div = 200; // 50ms
+        //int div = 100; // 100ms
         //int div = 20; //500ms
         //int div = 10; //1000ms
         uint64_t last_drain = start_t;
         #endif
-        uint64_t epoch_change_t = start_t;
+            #if MEASURE_TPCH_PER_EPOCH
+            uint64_t epoch_change_t = start_t;
+            #endif
         #endif
 
         uint64_t q_cnt_lcl = 0;
@@ -1402,47 +1417,60 @@ public:
             start_logdrain = false;
         }
 
-        #if TPCH_REPLICA && LOG_DRAIN_REQUEST
+        #if MEASURE_TPCH_PER_EPOCH
         if(runner_num == 0)
             std::cout<<"Epoch #\tDB size(MB)\tDB #elems\tq latency\tq per epoch\ttime\tdrain latency\tq/s\n";
-        #endif
         double q_latency_sum=0; // q latency in ms
         uint64_t q_latency_num=0;
         double drain_latency=0;
+        #endif
 
         while(true){
             auto curr_t = read_tsc();
             // only the designated thread should decide whether TPC-H is done or not. If not, it could be that some threads wait for the barrier to perform log drain wile other threads decided to be done!
-            #if CHANGE_EPOCH == 1
+            #if CHANGE_EPOCH == 0
+            if (runner_num == 0 && (curr_t - start_t) >= tsc_diff) { // done
+                tpch_done = true;
+                q_cnt = q_cnt_lcl;
+                break;
+            }
+            #elif CHANGE_EPOCH == 1
             if (runner_num == 0 && (curr_t - start_t) >= tsc_diff) { // done
                 tpch_done = true;
                 q_cnt = q_cnt_lcl;
                 break;
             }
             #elif CHANGE_EPOCH == 2
-            bool wait_for_txns = false;
+            // if we want to compare 2 different approaches, it makes sense to run specific number of queries, since running different number can affect the performance.
+            //bool wait_for_txns = false;
             //std::vector<uint64_t> max_q_per_epoch ( {200, 70, 50, 35, 25, 20, 18, 18, 10, 10, 10, 10, 8, 8, 8, 8} );
             // for larger DB + decompress/processing
-            std::vector<uint64_t> max_q_per_epoch ( {150, 50, 40, 20, 20, 15, 15, 12, 12, 12, 12, 10, 10, 10, 8, 8} );
-            if (runner_num == 0 && ( (curr_t - start_t) >= tsc_diff || global_log_epoch.value() > max_q_per_epoch.size() )){
+            //std::vector<uint64_t> max_q_per_epoch ( {150, 50, 40, 20, 20, 15, 15, 12, 12, 12, 12, 10, 10, 10, 8, 8} );
+            //if (runner_num == 0 && ( (curr_t - start_t) >= tsc_diff || global_log_epoch.value() > max_q_per_epoch.size() )){
+            if (runner_num == 0 && ( (curr_t - start_t) >= tsc_diff )){
                 tpch_done = true;
                 q_cnt = q_cnt_lcl;
                 break;
             }
             #endif
-
+            
                 
             if(tpch_done){
                 q_cnt = q_cnt_lcl;
                 break;
             }
             START_COUNTING
+            #if MEASURE_TPCH_PER_EPOCH
             auto q_start_time = read_tsc();
-            runner.run_next_query();
+            #endif
+            assert(global_log_epoch.value() != 0);
+            runner.run_next_query(global_log_epoch.value());
+            #if MEASURE_TPCH_PER_EPOCH
             if(runner_num==0){
                 q_latency_sum+= (double)(read_tsc()-q_start_time) / constants::million / constants::processor_tsc_frequency; // latency in ms
                 q_latency_num++;
             }
+            #endif
             //STOP_COUNTING(q_latencies, runner_num)
             q_cnt_lcl++;
             q_cnt_per_epoch++;
@@ -1474,10 +1502,10 @@ public:
                 uint64_t q_cnts_per_epoch_total = 0;
                 for(uint64_t q_cnt_per_e : q_cnts_per_epoch)
                     q_cnts_per_epoch_total += q_cnt_per_e;
-                if (q_cnts_per_epoch_total >= max_q_per_epoch[global_log_epoch.value()-1]){
+                /*if (q_cnts_per_epoch_total >= max_q_per_epoch[global_log_epoch.value()-1]){
                     start_logdrain = true;
                     wait_for_txns = true;
-                }
+                }*/
             }
             #endif
             /*
@@ -1491,6 +1519,7 @@ public:
                 #if CHANGE_EPOCH == 1
                 q_cnts_per_epoch[runner_num] = q_cnt_per_epoch;
                 #endif
+                // TODO: Add memory fence when waiting for log drain or when changing epoch, so that to guarantee that instructions are not reordered!
                 /* ================= LOG DRAIN PREPARE ============== */
                 int r = pthread_barrier_wait(&dbsync_barrier);
                 always_assert(r == PTHREAD_BARRIER_SERIAL_THREAD || r == 0, "Error in pthread_barrier_wait");
@@ -1503,21 +1532,23 @@ public:
                     curr_t = read_tsc();
                     double elapsed_time = (double)(curr_t - epoch_change_t) / constants::million / constants::processor_tsc_frequency; // elapsed time in ms
                     epoch_change_t = read_tsc();
-                    if(wait_for_txns){
+                    /*if(wait_for_txns){
                         uint64_t txns_total = 0;
                         do { // wait until we reach the desired number of tpc-c transactions and then start draining the log!
                             txns_total = 0;
                             for (const auto& txn_cnt : txn_cnts)
                                 txns_total+= txn_cnt;
                         }while(txns_total < global_log_epoch.value() * txns_per_epoch);
-                    }
+                    }*/
                     #endif
+                    #if MEASURE_TPCH_PER_EPOCH
                     // calculate per epoch Query throughput and other stats!
                     uint64_t q_cnts_per_epoch_total = 0;
                     for(uint64_t q_cnt_per_e : q_cnts_per_epoch)
                         q_cnts_per_epoch_total += q_cnt_per_e;
                     std::cout<< current_epoch.value()<<"\t"<< (double)dbp->db_size()/1024/1024 << "\t"<< dbp->db_num_elems() <<"\t"<< (q_latency_sum / q_latency_num) <<"\t"<< q_cnts_per_epoch_total << "\t"<< elapsed_time <<
                      "\t"<< drain_latency <<"\t"<< (double) q_cnts_per_epoch_total / (elapsed_time / 1000.0) <<std::endl; // q/sec
+                    #endif
                     start_logdrain = false;
                     usleep(20); // do not change the global epoch right away, since some threads will miss the log writer's signal before they call wait.
                     global_log_epoch++;
@@ -1528,7 +1559,6 @@ public:
                 log.wait_to_logdrain();
                 q_cnts_per_epoch[runner_num] = q_cnt_per_epoch = 0;
                 //std::cout<<runner_num <<" : Signaled!\n";
-                
                 /* ================= LOG DRAIN START ============== */
                 // perform log drain!
 
@@ -1538,7 +1568,9 @@ public:
                 };
                 int recs_replayed = 0;
                 //START_COUNTING_PRINT
+                #if MEASURE_TPCH_PER_EPOCH
                 auto logdrain_start = read_tsc();
+                #endif
                 for (int tbl=0; tbl<LOG_NTABLES; tbl++){
                     if(log.current_size(tbl)==0)
                         continue;
@@ -1548,10 +1580,12 @@ public:
                     recs_replayed += recs_n;
                     //std::cout <<"@"<< current_epoch.value() << ": Thread "<< runner_num<< " played "<< recs_n << " from " << tbl<<std::endl;
                 }
+                #if MEASURE_TPCH_PER_EPOCH
                 // measure drain latency
                 if(runner_num==0){
                     drain_latency =  (double)(read_tsc()-logdrain_start) / constants::million / constants::processor_tsc_frequency; // latency in ms
                 }
+                #endif
                 //STOP_COUNTING_PRINT(print_mutex, runner_num, recs_replayed)
                 //std::cout<< "Thread "<< runner_num<<", Replayed "<< recs_replayed<<std::endl;
                 /* ================= LOG DRAIN END ============== */
@@ -1840,9 +1874,13 @@ public:
         for (auto& cnt : q_cnts){
             q_total_count+= cnt;
         }
+        #if TPCH_REPLICA
         // measure TPCH DB!
         tpch_db * dbp = reinterpret_cast<tpch_db*>(olap_db);
         prof_tpch.finish_tpch(q_total_count, tpch_end, dbp->db_size());
+        #else
+        prof_tpch.finish_tpch(q_total_count, tpch_end, 0);
+        #endif
 
         // inspect dictionary!
         /*for(int i=0; i<db.num_warehouses(); i++){
@@ -2057,14 +2095,18 @@ public:
                 if(add_to_sec_index){
                     uint64_t did = bswap(k.o_d_id);
                     uint64_t oid = bswap(k.o_id);
-                    order_sec_value os_val;
                     auto val_p = db.tbl_orders(wid).nontrans_put_el_if_ts(k, v, ts);
                     if(!val_p)
                         return true;
+                    // even if key is found, we need to  upate the secondary index and reset the query_result (maybe after the update, the query is not satisfied anymore!)
+                    order_sec_value os_val;
                     // store the internal_elem
                     os_val.o_c_entry_d_p = val_p;
-                    // put into the secondary index as well
-                    db.tbl_sec_orders().nontrans_put(order_sec_key(v.o_entry_d, wid, did, oid), os_val, true /* measure db size */);
+                    // if the key was found, it is simply an update and we don't need to insert in the secondary index! However, we should invalidate the corresponding cached query result in the sec index by inserting a new value!
+                    // What if current thread inserts in orders at specific ts, get the val_p, attempt to insert it to secondary index, but another thread with higher ts
+                    // inserts to orders and attempts to insert its own val_p to secondary index? Who will win?
+                    // Use nontrans_put_if_ts to solve this problem! In that case, only the one with > ts will be applied to both orders and secondary index!
+                    db.tbl_sec_orders().nontrans_put_if_ts(order_sec_key(v.o_entry_d, wid, did, oid), os_val, ts);
                 }
                 else{
                     db.tbl_orders(wid).nontrans_put_if_ts(k, v, ts);
@@ -2095,7 +2137,27 @@ public:
                     db.dict[runner_num].nontrans_put(s, typename tpch_db::StrId(1));
                 }
                 #endif
-                db.tbl_orderlines(wid).nontrans_put_if_ts(k, v, ts);
+                bool inserted = db.tbl_orderlines(wid).nontrans_put_if_ts(k, v, ts);
+                #if EXTENDED_SEC_INDEX && INVALIDATE
+                if(inserted && cmd == logcmd_replace){ // we must invalidate the corresponding entry in the secondary index! (That depends on this index)
+                    // go to orders table and get this order:
+                    order_key ok(wid, bswap(k.ol_d_id), bswap(k.ol_o_id));
+                    order_value* val_p;
+                    uint64_t* elem;
+                    std::tie(val_p, elem) = db.tbl_orders(wid).nontrans_get_el(ok);
+                    // it could be that the order doesn't exist yet (If it was inserted by a different thread that its log isn't drained yet!)
+                    //assert(val_p);
+                    if(!val_p) // key not found in orders table. It could be that the responsible log drain thread hasn't added it yet!
+                        return true;
+                    // invalidate the query_res!
+                    // TODO: Make a lightweight function that simply invalidates the q_res without affecting the rest! We must make the query result generic and not key-specific.
+                    order_sec_value os_val;
+                    os_val.o_c_entry_d_p = elem;
+                    db.tbl_sec_orders().nontrans_put_if_ts(order_sec_key(val_p->o_entry_d, wid, bswap(k.ol_d_id), bswap(k.ol_o_id)), os_val, ts);
+                }
+                #else
+                (void)inserted;
+                #endif
             }
         }
         else if(cmd == logcmd_remove){
@@ -2521,7 +2583,7 @@ public:
         #endif
         #if TPCH_SINGLE_NODE
             prof_tpch.start(profiler_mode);
-            run_benchmark(db, nullptr /*No dedicated OLAP DB!*/, prof, prof_tpch, num_threads, run_cpus, run_tpch_cpus, time_limit, mix, verbose);
+            run_benchmark(db, nullptr /*No dedicated OLAP DB!*/, prof, prof_tpch, num_threads, run_cpus, run_tpch_cpus, time_limit, txns_per_epoch /*epochs should be 0 here! (No epochs used)*/, mix, verbose);
             // measure throughput inside run_benchmark to only take into account the tpcc transactions and not the tpch
         #elif TPCH_REPLICA
             prof_tpch.start(profiler_mode);
