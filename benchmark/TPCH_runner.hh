@@ -157,39 +157,110 @@ class tpch_db {
     void q4_stats(){
         std::cout<<"Q.4 orders: \n";
         for(auto& od : q4_date_ods){
-            std::cout<<od.second<<std::endl;
+            if ( od.second > 1)
+                std::cout<<od.second<<std::endl;
         }
     }
 
 };
 
+
+enum class query_type : int {
+    Q1=1,  Q2,  Q3,  Q4,  Q5,  Q6,
+    Q7,    Q8,  Q9,  Q10, Q11, Q12,
+    Q13,   Q14, Q15, Q16, Q17, Q18,
+    Q19,   Q20, Q21, Q22
+};
+
+
+//using template <typename DBParams> class tpch_runner = tpch_runner_t;
+
 template <typename DBParams>
 class tpch_runner {
 public:
     // the database will be either hybrid_db (single_node == true), or tpch_db (false).
-    tpch_runner(int id, tpcc::tpcc_input_generator& ig, void* database): db(database), runner_id(id), ig(ig) { }
+    tpch_runner(int id, tpcc::tpcc_input_generator& ig, std::vector<query_type>& qs, void* database): db(database), runner_id(id), current_query_ind(0), ig(ig) {
+        for(auto q : qs){
+            switch(q){
+                case query_type::Q1:
+                    queries.emplace_back(new query1(this));
+                    break;
+                case query_type::Q4:
+                    queries.emplace_back(new query4(this));
+                    break;
+                default:
+                    std::cout<<"Error: Query " << static_cast<typename std::underlying_type<query_type>::type>(q) << " not supported\n";
+                    assert(false);
+                    break;
+            }
+        }
+
+    }
 
     // finds the next query to be run for this thread (round-robin) and runs it
-    void run_next_query();
+    void run_next_query(uint64_t epoch=0);
+    
+    class query_base {
+        protected:
+        query_type qt;
+        tpch_runner<DBParams>* runner;
+        public:
+        virtual void run_query(uint64_t epoch=0)=0;
+        virtual ~query_base(){}
+    };
 
-    void run_query4();
+    class query1 : public query_base {
+        public:
+        query1(tpch_runner<DBParams> * r){
+            this->qt = query_type::Q1;
+            this->runner = r;
+        }
+        virtual void run_query(uint64_t epoch=0) override;
+        ~query1(){}
+    };
+
+    class query4 : public query_base {
+        typedef tpcc::order_sec_key::oid_type oid_type;
+        typedef tpcc::order_sec_key::wdid_type wdid_type;
+
+        // a struct holding the required columns for the final result
+        struct result_cols_q4 {
+            #if LATE_MATERIALIZATION
+            internal_elem* el; // the pointer to the primary index of orders holding the entire row
+            #endif
+            uint64_t o_entry_d;
+            uint64_t o_ol_cnt;
+            wdid_type o_wid;
+            wdid_type o_did;
+            oid_type o_id;
+
+            #if LATE_MATERIALIZATION
+            result_cols_q4(internal_elem* e, uint64_t entry_d, uint64_t ol_cnt, wdid_type w, wdid_type d, oid_type id) : 
+                                        el(e), o_entry_d(entry_d), o_ol_cnt(ol_cnt), o_wid(w), o_did(d), o_id(id) {}
+            #endif
+            result_cols_q4(uint64_t entry_d, uint64_t ol_cnt, wdid_type w, wdid_type d, oid_type id) : 
+                                        o_entry_d(entry_d), o_ol_cnt(ol_cnt), o_wid(w), o_did(d), o_id(id) {}
+        };
+
+        public:
+        query4(tpch_runner<DBParams> * r){
+            this->qt = query_type::Q4;
+            this->runner = r;
+        }
+        virtual void run_query(uint64_t epoch=0) override;
+        ~query4(){}
+    };
 
 private:
     void* db;
     int runner_id;
+    int current_query_ind;
     tpcc::tpcc_input_generator &ig;
     static constexpr bool single_node = TPCH_SINGLE_NODE;
     friend class tpcc::tpcc_access<DBParams>;
 
-    
-
     static constexpr bool Commute = DBParams::Commute;
-    enum class query_type : int {
-        Q1=1,  Q2,  Q3,  Q4,  Q5,  Q6,
-        Q7,    Q8,  Q9,  Q10, Q11, Q12,
-        Q13,   Q14, Q15, Q16, Q17, Q18,
-        Q19,   Q20, Q21, Q22
-    };
+    std::vector<unique_ptr<query_base>> queries;
 };
 
 };
