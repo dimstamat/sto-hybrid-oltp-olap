@@ -1,9 +1,26 @@
 #pragma once
 
+class logset_base;
+template <int N_TBLS>
+class logset_tbl;
+
+extern logset_base* logs;
+
+#ifndef LOG_NTABLES // should be defined in TPCC_bench.hh
+#define LOG_NTABLES 0
+#endif
+
 namespace bench {
 // unordered index implemented as hashtable
-template <typename K, typename V, typename DBParams>
+template <typename K, typename V, typename DBParams, short LOG=0>
 class unordered_index : public index_common<K, V, DBParams>, public TObject {
+
+// Dimos - emable logging
+// template argument LOG
+// 0 : no logging
+// 1 : default logging - one log per thread
+// 2 : one log per thread per table
+// 3 : one std::unordered_map per thread per table
 public:
     // Premable
     using C = index_common<K, V, DBParams>;
@@ -34,6 +51,8 @@ public:
 
     using C::index_read_my_write;
 
+    static constexpr TransItem::flags_type log_add_bit = TransItem::user0_bit << 4u;
+
     typedef typename get_occ_version<DBParams>::type bucket_version_type;
 
     typedef std::hash<K> Hash;
@@ -61,10 +80,36 @@ public:
         }
     };
 
-    static void thread_init() {}
+    void thread_init() {}
+
+    void thread_init(int runner_num) {
+        // set logger!
+        if(LOG == 2){
+            if(!logger_ && logs)
+                set_logger_(& (reinterpret_cast<logset_tbl<LOG_NTABLES>*>(logs))->log(runner_num)); // get the corresponding log for that thread!
+        }
+    }
+
+    loginfo* logger() const {
+        return (loginfo*)logger_;
+    }
+
+    void* logger_tbl() const{
+        return logger_;
+    }
+    
+    
+
+
     ~unordered_index() override {}
 
 private:
+
+    void set_logger_(void* logger) {
+        assert(!logger_ && logger);
+        logger_ = logger;
+    }
+
     struct bucket_entry {
         internal_elem *head;
         // this is the bucket version number, which is incremented on insert
@@ -83,13 +128,18 @@ private:
 
     uint64_t key_gen_;
 
+    // the index of this table in the log buffer when we choose one log per thread per table
+    int tbl_index_=0;
+
+    static __thread void* logger_; // one logger per thread! This will point to the corresponding log for that thread.
+
     // used to mark whether a key is a bucket (for bucket version checks)
     // or a pointer (which will always have the lower 3 bits as 0)
     static constexpr uintptr_t bucket_bit = C::item_key_tag;
 
 public:
     // split version helper stuff
-    using index_t = unordered_index<K, V, DBParams>;
+    using index_t = unordered_index<K, V, DBParams, LOG>;
     using column_access_t = typename split_version_helpers<index_t>::column_access_t;
     using item_key_t = typename split_version_helpers<index_t>::item_key_t;
     template <typename T>
@@ -101,14 +151,22 @@ public:
 
     // Main constructor
     unordered_index(size_t size, Hash h = Hash(), Pred p = Pred()) :
-            map_(), hasher_(h), pred_(p), key_gen_(0) {
+            map_(), hasher_(h), pred_(p), key_gen_(0), tbl_index_(-1) {
         map_.resize(size);
     }
 
     // Dimos - we need an empty constructor for the log! -> see log.hh
     unordered_index(Hash h = Hash(), Pred p = Pred()) :
-            map_(), hasher_(h), pred_(p), key_gen_(0) {
+            map_(), hasher_(h), pred_(p), key_gen_(0), tbl_index_(-1) {
     }
+
+    // tbl_index: the index of this table in the log buffer
+    unordered_index(size_t size, int tbl_index, Hash h = Hash(), Pred p = Pred()) :
+            map_(), hasher_(h), pred_(p), key_gen_(0), tbl_index_(tbl_index) {
+        map_.resize(size);
+        assert(tbl_index>=0);  //&& tbl_index <= logs_tbl->log(runner_num). getNumtbl ?? )
+    }
+
 
     inline size_t hash(const key_type& k) const {
         return hasher_(k);
@@ -251,6 +309,8 @@ public:
         auto e = reinterpret_cast<internal_elem*>(rid);
         auto row_item = Sto::item(this, item_key_t::row_item_key(e));
         row_item.acquire_write(e->version(), new_row);
+        if(LOG > 0)
+            row_item.add_flags(log_add_bit);
     }
 
     void update_row(uintptr_t rid, const comm_type &comm) {
@@ -291,7 +351,11 @@ public:
                 if (!row_item.observe(e->version()))
                     return ins_abort;
             }
-
+            #if ADD_TO_LOG > 0
+            if(LOG > 0 && overwrite){
+                row_item.add_flags(log_add_bit);
+            }
+            #endif
             return { true, true };
         } else {
             // insert the new row to the table and take note of bucket version changes
@@ -311,7 +375,11 @@ public:
             // XXX adding write is probably unnecessary, am I right?
             item.template add_write<value_type*>(vptr);
             item.add_flags(insert_bit);
-
+            #if ADD_TO_LOG > 0
+            if(LOG > 0){
+                bucket_item.add_flags(log_add_bit);
+            }
+            #endif
             return { true, false };
         }
     }
@@ -425,6 +493,120 @@ public:
         }
     }
 
+    inline void log_add(TransItem& item, internal_elem* e){
+        logcommand cmd;
+        if(has_insert(item)){
+            cmd = logcmd_put;
+        } else if(has_delete(item)){
+            cmd = logcmd_remove;
+        } else {
+            cmd = logcmd_replace;
+        }
+        #if LOG_DRAIN_REQUEST
+        kvepoch_t global_epoch_cp = global_log_epoch; // get a copy of the global log epoch. If it changes later on, we will see it during the next check
+        #endif
+
+        //TODO: Only for the first TItem in the write set:
+        //      - check whether request_log_drain is true and if it is, set local_epoch = global_epoch. This will ensure that we decide in which epoch this transaction belongs to at commit time, and before we start logging its TItems.
+        // assign timestamp
+        loginfo::query_times qtimes;
+        //qtimes.ts = Sto::commit_tid(); // this won't work because there are no commit_tids set in Non-opaque/OCC so this will use global counter!
+        //qtimes.prev_ts =  ( !has_insert(item) && !(has_delete(item)) ? TThread::txn->prev_commit_tid() : 0 );
+        qtimes.ts = e->version().value();
+        qtimes.prev_ts = 0;
+        void* logger = logger_tbl();
+        // check if there is a pending request for log drain and advance local epoch if there is!!
+        #if LOGGING == 2 && LOG_DRAIN_REQUEST
+        bool signal_logdrainer = false;
+        // We need to know whether this is the first TItem from the write set to be added to the log
+        // This is in case we have concurrent log drainers so that to advance local epoch right before committing the current txn!
+        // A log drain is requested. Simply advance local log epoch (will happen later on) and signal the condition variable of waiting log drainers
+        if(((reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(logger))->get_local_epoch() < global_epoch_cp) && item.has_flag(TransItem::first_titem_bit) ){  // change epoch now!
+            signal_logdrainer = true; // signal the cond variable that the log drainer is waiting on. It should be signaled right after we record a log record with the new log epoch (which is not visible to the log drainer)
+            qtimes.epoch = global_epoch_cp;
+        }
+        else { // do not change epoch yet! Do it in the next transaction!
+            qtimes.epoch = (reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(logger))->get_local_epoch();
+        }
+        #else
+            qtimes.epoch = global_log_epoch;
+        #endif
+        if(logger){
+            // Must use a local log_epoch so that to increase only when a log drain is requested AND the current transaction is committed and fully applied in the log. We will do local_epoch = global_epoch only when transaction committed successfully (in TPCC_bench.hh)
+            value_type* valp;
+            if(has_insert(item)){
+                #if LOGREC_OVERWRITE
+                if(LOG == 2)
+                    valp = & ((reinterpret_cast<internal_elem_log*>(e))->row_container.row);
+                else
+                    valp = &e->row_container.row;
+                #else
+                    valp = &e->row_container.row;
+                #endif
+            }
+            else{
+                valp = item.template raw_write_value<value_type*>();
+            }
+            if(LOG == 1)
+                reinterpret_cast<loginfo*>(logger)->record(cmd, qtimes, Str(e->key), Str(*valp), tbl_index_);
+            else if(LOG == 2){
+                auto logger_tbl = reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(logger);
+                // experiment with not converting to string but storing the actual key: 
+                // Not converting to string is a tiny bit better in high contention and a bit worse in low contention.
+                // Even Str() converts the struct to Str but keeps the entire size of the struct and not the actual size of the constructed string!
+                // In both cases it  writes more bytes because the size of key in orders table is 3 64-bit uints and thus occupies 24 bytes even for small numbered kes.
+                // Experiment with converting to Str (call to_str()), and then we will only write as many digits as the key. A small key would only be 3 bytes (1 digit per key part: warehouse, district, o_id).
+                //auto callback = [] (logrec_kv* lr) -> void {
+                //};
+                #if LOG_RECS == 1 || LOG_RECS == 3
+                #if LOGREC_OVERWRITE
+                int log_indx = logger_tbl->get_log_index();
+                //std::cout<<"indx: "<< log_indx<<std::endl;
+                internal_elem_log* el = reinterpret_cast<internal_elem_log*>(e);
+                //if(cmd == logcmd_replace && el->log_pos[log_indx] >= 0){ // specify the location of the log record! This will overwrite existing log record for this key
+                // TODO: either >=0, or >0, depending on how we initialize the log_pos!
+                if(cmd == logcmd_replace &&  el->get_creation_epoch(log_indx) == qtimes.epoch.value()){ // specify the location of the log record! This will overwrite existing log record for this key, if they are for the same epoch
+                    // make sure to check whether e->log_pos[log_indx] exists. It could be that the log command is replace (update_row), but it does not exist in the log! In case we apply the log entries after DB prepopulation and clear the log!
+                    //logger_tbl->record(cmd, qtimes, Str(el->key), Str(*valp), tbl_index_,  el->log_pos[log_indx] );
+                    // TODO: for now do not overwrite, just to test the overhead of storing the log pos and epoch!
+                    el->update_log_pos(log_indx, logger_tbl->record(cmd, qtimes, Str(el->key), Str(*valp), tbl_index_, el->get_log_pos(log_indx)));
+                    //logger_tbl->record(cmd, qtimes, Str(el->key), Str(*valp), tbl_index_);
+                }
+                else if (el->get_creation_epoch(log_indx) == 0) // there is no log record location for this key (creation epoch =0), store it!
+                    el->set_log_pos(log_indx, logger_tbl->record(cmd, qtimes, Str(el->key), Str(*valp), tbl_index_), qtimes.epoch.value());
+                else // different epoch, do not update!
+                    logger_tbl->record(cmd, qtimes, Str(el->key), Str(*valp), tbl_index_);
+                #else
+                logger_tbl->record(cmd, qtimes, Str(e->key), Str(*valp), tbl_index_);
+                #endif
+                #if LOGGING == 2 && LOG_DRAIN_REQUEST
+                    if(signal_logdrainer){
+                        // add new epoch log record to all tables!
+                        for (int i=0; i<LOG_NTABLES; i++){
+                            if(logger_tbl->current_size(i) > 0 && i != tbl_index_)
+                                logger_tbl->record_new_epoch(i, qtimes.epoch);
+                        }
+                        //if(logger_tbl->get_log_index() == 0) // do not signal the first log drainer right away otherwise it will miss the signal!
+                            usleep(10);
+                        //std::cout<<"Signaling log drainer!\n";
+                        logger_tbl->signal_to_logdrain(); // signal the cond variable that the log drainer is waiting on. It should be signaled right after we record a log record with the new log epoch (which is not visible to the log drainer)
+                        signal_logdrainer = false;
+                    }
+                #endif
+                #elif LOG_RECS == 2
+                const char* k = e->key.to_str();
+                const char* v = valp->to_str();
+                reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(logger)->record(cmd, qtimes, k, strlen(k), v, strlen(v), tbl_index_);
+                delete[] k;
+                delete[] v;
+                #endif
+                //reinterpret_cast<loginfo_tbl<LOG_NTABLES>*>(logger)->record(cmd, qtimes, &e->key, sizeof(e->key), valp, sizeof(value_type), tbl_index_);
+            }
+            else if(LOG == 3)
+                reinterpret_cast<loginfo_map<LOG_NTABLES>*>(logger)->record(cmd, qtimes, Str(e->key), Str(*valp), tbl_index_);
+        }
+    }
+
     void install(TransItem& item, Transaction& txn) override {
         assert(!is_bucket(item));
         auto key = item.key<item_key_t>();
@@ -472,6 +654,11 @@ public:
             }
             txn.set_version_unlock(e->row_container.version_at(key.cell_num()), item);
         }
+        // add to log here, so that we already have the updated version.
+        #if ADD_TO_LOG == 2
+            if(LOG > 0 && has_log_add(item))
+                log_add(item, e);
+        #endif
     }
 
     void unlock(TransItem& item) override {
@@ -485,6 +672,13 @@ public:
     }
 
     void cleanup(TransItem& item, bool committed) override {
+        #if ADD_TO_LOG == 1
+        if(LOG > 0 && committed && has_log_add(item)){
+            auto key = item.key<item_key_t>();
+            auto e = key.internal_elem_ptr();
+            log_add(item, e);
+        }
+        #endif
         if (committed ? has_delete(item) : has_insert(item)) {
             assert(!is_bucket(item));
             auto key = item.key<item_key_t>();
@@ -580,6 +774,10 @@ private:
         return (!e->valid() && !has_insert(item));
     }
 
+    static bool has_log_add(const TransItem& item){
+        return (item.flags() & log_add_bit) != 0;
+    }
+
     // TransItem keys
     static bool is_bucket(const TransItem& item) {
         return item.key<uintptr_t>() & bucket_bit;
@@ -601,6 +799,9 @@ private:
         table_row->row_container.row = *value;
     }
 };
+
+template <typename K, typename V, typename DBParams, short LOG>
+__thread void* unordered_index<K, V, DBParams, LOG>::logger_;
 
 // MVCC variant
 template <typename K, typename V, typename DBParams>
@@ -654,6 +855,11 @@ public:
     };
 
     static void thread_init() {}
+
+    static void thread_init(int runner_num) {
+        (void)runner_num;
+    }
+
     ~mvcc_unordered_index() override {}
 
 private:
@@ -675,6 +881,9 @@ private:
 
     uint64_t key_gen_;
 
+    // the index of this table in the log buffer
+    int tbl_index_=0;
+
     // used to mark whether a key is a bucket (for bucket version checks)
     // or a pointer (which will always have the lower 3 bits as 0)
     static constexpr uintptr_t bucket_bit = C::item_key_tag;
@@ -687,9 +896,17 @@ public:
 
     // Main constructor
     mvcc_unordered_index(size_t size, Hash h = Hash(), Pred p = Pred()) :
-            map_(), hasher_(h), pred_(p), key_gen_(0) {
+            map_(), hasher_(h), pred_(p), key_gen_(0), tbl_index_(-1) {
         map_.resize(size);
     }
+
+    // tbl_index: the index of this table in the log buffer
+    mvcc_unordered_index(size_t size, int tbl_index, Hash h = Hash(), Pred p = Pred()) :
+            map_(), hasher_(h), pred_(p), key_gen_(0), tbl_index_(tbl_index) {
+        map_.resize(size);
+        assert(tbl_index>=0);  //&& tbl_index <= logs_tbl->log(runner_num). getNumtbl ?? )
+    }
+
 
     inline size_t hash(const key_type& k) const {
         return hasher_(k);
