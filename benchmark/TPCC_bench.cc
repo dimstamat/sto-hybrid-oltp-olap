@@ -5,6 +5,8 @@
 
 
 #include "TPCC_bench.hh"
+logset_base* logs; // the logs required for the replicated scheme!
+
 #include "TPCC_txns.hh"
 
 #include "PlatformFeatures.hh"
@@ -23,6 +25,7 @@ const Clp_Option options[] = {
         { "nthreads",     't', opt_nthrs, Clp_ValInt,    Clp_Optional },
         { "db-numa",      'd', opt_db_numa, Clp_ValInt,  Clp_Optional },
         { "run-numa",     'u', opt_run_numa,Clp_ValString, Clp_Optional },
+        { "txns-per-epoch",'e', opt_txns_per_epoch,Clp_ValInt, Clp_Optional },
         { "sibling",      's', opt_sibling, Clp_NoVal, Clp_Optional },
         { "time",         'l', opt_time,  Clp_ValDouble, Clp_Optional },
         { "perf",         'p', opt_perf,  Clp_NoVal,     Clp_Optional },
@@ -56,6 +59,8 @@ void print_usage(const char *argv_0) {
        << "    Specify the NUMA node that will contain the DB (warehouses index)."<<std::endl
        << "  --run-numa=<NODE1,NODE2,...>"<< std::endl
        << "    Specify the NUMA nodes to run workers on. Only the required number of NUMA nodes will be used, with the given order (depending on the --nthreads value)." <<std::endl
+       << "  --txns-per-epoch=<NUM>" <<std::endl
+       << "    The number of transactions per epoch, when using the replicated scheme with concurrent log drains" <<std::endl
        << "  --sibling" <<std::endl
        << "    Whether to assign threads to sibling cores or not (if hyper-threading is enabled)" <<std::endl
        << "  --time=<NUM> (or -l<NUM>)" << std::endl
