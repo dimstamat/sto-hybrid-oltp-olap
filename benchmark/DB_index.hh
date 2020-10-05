@@ -286,5 +286,7 @@ public:
 
 }; // namespace bench
 
+#include "log.hh"
+
 #include "DB_uindex.hh"
 #include "DB_oindex.hh"
